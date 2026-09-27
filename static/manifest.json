@@ -1,0 +1,8 @@
+{
+  "name": "Legacy Real",
+  "short_name": "Legacy Real",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f6fa",
+  "theme_color": "#1f3a8a"
+}

@@ -1,0 +1,19 @@
+# secrets
+.env
+# prospect data -- stays on the server, never in git
+reports/
+results/
+chats/
+jobs/
+leads*.csv
+zillow_agents.txt
+zillow_raw.json
+zillow-cache/
+search-cache/
+page-sources/
+test_armstrong.html
+*.log
+# browser profiles / caches
+browser-profile/
+zillow-profile/
+__pycache__/
