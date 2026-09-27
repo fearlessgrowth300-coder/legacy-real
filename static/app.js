@@ -334,6 +334,7 @@ function leadSheet(r) {
   sheet(r['Business Name'] || 'Lead', h('span', {class: 'pill ' + t}, t), body, researchBtn);
 }
 
+let chatTimer = null;
 async function chat(slug) {
   const p = page('Prospect chat', 'Paste what they reply. You get what it means and your next message, from your Sales Brain.');
   const people = await api('/api/people');
@@ -353,7 +354,10 @@ async function chat(slug) {
   if (!d.turns.length) conv.append(h('p', {class: 'small muted'}, 'Your first message is ready below — send it on LinkedIn, then tap "Log as sent".'));
   for (const t of d.turns) {
     conv.append(h('div', {class: 'bubble ' + (t.role === 'me' ? 'me' : 'them')}, h('div', {class: 'meta'}, `${t.role === 'me' ? 'You' : d.name} · ${t.at || ''}`), t.text));
-    if (t.coach) {
+    if (t.coach && t.coach.pending) {
+      conv.append(h('div', {class: 'coach row'}, h('span', {class: 'spin'}), 'Reading their reply with your Sales Brain… (30–90s)'));
+      clearTimeout(chatTimer); chatTimer = setTimeout(() => { if (location.hash === '#/chat/' + slug) route(); }, 4000);
+    } else if (t.coach) {
       const c = t.coach, box = h('div', {class: 'coach'});
       for (const [k, l] of [['said', 'What they said'], ['meaning', 'What it means'], ['next_goal', 'Next goal']]) if (c[k]) box.append(h('div', {class: 'k'}, l), h('div', {}, c[k]));
       if (c.reply) box.append(h('div', {class: 'k'}, 'Suggested reply'), h('div', {class: 'reply'}, c.reply));

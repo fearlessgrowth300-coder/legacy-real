@@ -492,13 +492,24 @@ class Handler(BaseHTTPRequestHandler):
             if not text:
                 return self._send({"error": "empty"}, 400)
             slug, (name, report_path) = match[1], people()[match[1]]
-            chat = load_chat(slug)
             turn = {"role": "me" if match[2] == "mine" else "them", "text": text,
                     "at": time.strftime("%Y-%m-%d %H:%M")}
             if match[2] == "theirs":
-                turn["coach"] = coach(name, open(report_path, encoding="utf-8").read(), chat["turns"], text)
-            chat["turns"].append(turn)
-            save_chat(slug, chat)
+                turn["coach"] = {"pending": True}  # 30-90s of AI work: answer now, fill in when done
+            with LOCK:  # the background coach writes the same file
+                chat = load_chat(slug)
+                history = list(chat["turns"])
+                chat["turns"].append(turn)
+                index = len(chat["turns"]) - 1
+                save_chat(slug, chat)
+            if match[2] == "theirs":
+                def work():
+                    result = coach(name, open(report_path, encoding="utf-8").read(), history, text)
+                    with LOCK:
+                        latest = load_chat(slug)
+                        latest["turns"][index]["coach"] = result
+                        save_chat(slug, latest)
+                threading.Thread(target=work, daemon=True).start()
             return self._send({"ok": True})
         self._send({"error": "not found"}, 404)
 
