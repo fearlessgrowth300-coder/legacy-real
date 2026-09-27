@@ -32,6 +32,8 @@ const ICONS = {
   flame: '<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.07-2.14-.22-4.05 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.15.43-2.29 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',
   building: '<rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4M8 6h.01M16 6h.01M12 6h.01M12 10h.01M12 14h.01M16 10h.01M16 14h.01M8 10h.01M8 14h.01"/>',
   alert: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/>',
   plug: '<path d="M12 22v-5M9 8V2M15 8V2M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/>',
 };
 function icon(name) {
@@ -180,7 +182,7 @@ async function dashboard() {
   p.append(h('div', {class: 'grid g2', style: 'margin-top:14px'}, top, recent));
   const sets = await api('/api/results');
   if (sets.length) {
-    const rows = await api('/api/results/' + esc(sets[0].file));
+    const rows = (await api('/api/results/' + esc(sets[0].file))).map(r => ({...r, _file: sets[0].file}));
     p.append(h('div', {class: 'card', style: 'margin-top:14px'},
       h('div', {class: 'card-head'}, h('h2', {}, `Contacts · ${sets[0].label} · ${rows.length}`),
         h('div', {class: 'row'}, h('a', {class: 'btn secondary sm', href: `/api/results/${esc(sets[0].file)}?download=1`}, icon('download'), 'CSV'),
@@ -330,7 +332,7 @@ async function leads(_, params) {
   };
   const load = async () => {
     grid.innerHTML = ''; grid.append(skeleton(3)); dl.href = `/api/results/${esc(pick.value)}?download=1`;
-    rows = await api('/api/results/' + esc(pick.value)); draw();
+    rows = (await api('/api/results/' + esc(pick.value))).map(r => ({...r, _file: pick.value})); draw();
   };
   pick.onchange = load; q.oninput = draw; await load();
 }
@@ -375,14 +377,17 @@ function leadSheet(r) {
   const city = (() => { const parts = (r['Address'] || '').split(',').map(s => s.trim()); return parts.length >= 3 ? `${parts[1]}, ${parts[2].split(' ')[0]}` : (r['Address'] || ''); })();
   const researchBtn = h('a', {class: 'btn sm', href: `#/research?name=${esc(r['Business Name'] || '')}&city=${esc(city)}&brokerage=${esc(r['Brokerage'] || '')}&sites=${esc(safeUrl(r['Website URL']) || '')}`,
     onclick: () => document.querySelector('.overlay')?.remove()}, icon('research'), 'Research');
-  sheet(r['Business Name'] || 'Lead', h('span', {class: 'pill ' + t}, t), body, researchBtn);
+  const mailBtn = emails.length && r._file ? h('button', {class: 'btn sm', onclick: () => emailSheet({emails, lead: r['Business Name'],
+    draft: async () => waitTask((await api('/api/email/draft', {file: r._file, name: r['Business Name']})).task)})}, icon('mail'), 'Write email') : null;
+  sheet(r['Business Name'] || 'Lead', h('span', {class: 'pill ' + t}, t), body, h('div', {class: 'row'}, mailBtn, researchBtn));
 }
 
 let chatTimer = null;
 async function chat(slug) {
-  const p = page('Prospect chat', 'Paste what they reply. You get what it means and your next message, from your Sales Brain.');
+  const p = page('Prospect chat', 'Paste what they reply. You get what it means and your next message, from your Sales Brain.',
+    h('button', {class: 'btn', onclick: newChat}, icon('plus'), 'New chat'));
   const people = await api('/api/people');
-  if (!people.length) { p.append(h('div', {class: 'card'}, empty('chat', 'No conversations yet', 'Research someone first — their chat appears here.', h('a', {class: 'btn', href: '#/research'}, 'Research a person')))); return; }
+  if (!people.length) { p.append(h('div', {class: 'card'}, empty('chat', 'No conversations yet', 'Start one from screenshots of their LinkedIn, Instagram or Facebook page — or research someone.', h('button', {class: 'btn', onclick: newChat}, icon('image'), 'New chat from screenshots')))); return; }
   const wrap = h('div', {class: 'chat' + (slug ? ' open' : '')});
   const list = h('div', {class: 'card people'}, h('h2', {style: 'margin-bottom:6px'}, 'People'));
   for (const x of people) list.append(h('div', {class: 'item', style: slug === x.slug ? 'background:var(--surface-2);border-radius:10px' : '', onclick: () => go('#/chat/' + x.slug)},
@@ -423,9 +428,80 @@ async function chat(slug) {
   const log = h('button', {class: 'btn secondary', onclick: async () => {
     if (!mine.value.trim()) return; await api(`/api/chat/${slug}/mine`, {text: mine.value}); toast('Logged'); route();
   }}, icon('send'), d.turns.length ? 'Log my message' : 'Log as sent');
+  const byEmail = h('button', {class: 'btn secondary', onclick: () => emailSheet({to: d.email || '', body: mine.value, slug, lead: d.name, onSent: route})}, icon('mail'), 'Send by email');
   thread.append(header, conv, h('div', {class: 'composer'}, h('div', {class: 'card'},
     field('Their reply', theirs), h('div', {class: 'form-actions', style: 'margin-top:10px'}, analyze),
-    h('div', {class: 'divider'}), field('Your message', mine), h('div', {class: 'form-actions', style: 'margin-top:10px'}, log))));
+    h('div', {class: 'divider'}), field('Your message', mine), h('div', {class: 'form-actions', style: 'margin-top:10px'}, log, byEmail),
+    d.email ? h('p', {class: 'tiny muted', style: 'margin-top:6px'}, 'Email: ' + d.email) : null)));
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function waitTask(id) {  // long AI work runs on the server; poll until it's done
+  for (;;) { await sleep(3000); const t = await api('/api/tasks/' + id); if (t.status === 'error') throw new Error(t.error); if (t.status === 'done') return t; }
+}
+async function shrink(file) {  // phone screenshots are huge: keep text readable, send ~200KB each
+  const img = await createImageBitmap(file); const k = Math.min(1, 1200 / img.width, 4000 / img.height);
+  const c = h('canvas', {width: Math.round(img.width * k), height: Math.round(img.height * k)});
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); return c.toDataURL('image/jpeg', 0.82);
+}
+function newChat() {
+  const files = []; const thumbs = h('div', {class: 'thumbs'});
+  const pickFiles = h('input', {type: 'file', accept: 'image/*', multiple: true, style: 'display:none', onchange: () => { add([...pickFiles.files]); pickFiles.value = ''; }});
+  const drawThumbs = () => { thumbs.replaceChildren(...files.map((f, i) => h('div', {class: 'thumb'}, h('img', {src: URL.createObjectURL(f), alt: ''}),
+    h('button', {type: 'button', 'aria-label': 'Remove', onclick: () => { files.splice(i, 1); drawThumbs(); }}, icon('x'))))); };
+  const add = list => { for (const f of list) if (f.type.startsWith('image/') && files.length < 8) files.push(f); drawThumbs(); };
+  const platform = h('select', {name: 'platform'}, ['LinkedIn', 'Instagram', 'Facebook', 'Other'].map(v => h('option', {value: v}, v)));
+  const status = h('div', {class: 'small', style: 'margin-top:10px'});
+  const form = h('form', {class: 'stack', onsubmit: async e => {
+    e.preventDefault(); if (!files.length) return toast('Add at least one screenshot', true);
+    const btn = form.querySelector('button[type=submit]'); btn.disabled = true;
+    try {
+      status.replaceChildren(h('span', {class: 'spin'}), ' Uploading…');
+      const images = await Promise.all(files.map(shrink));
+      const {task} = await api('/api/chat/new', {...formData(form), images});
+      status.replaceChildren(h('span', {class: 'spin'}), ' Reading their page, asking your Sales Brain, writing your opener… (1–3 min)');
+      const t = await waitTask(task); close(); toast('Chat ready'); go('#/chat/' + t.slug);
+    } catch (err) { status.textContent = ''; toast(err.message, true); btn.disabled = false; }
+  }},
+    h('div', {class: 'drop', onclick: () => pickFiles.click(), ondragover: e => e.preventDefault(), ondrop: e => { e.preventDefault(); add([...e.dataTransfer.files]); }},
+      icon('image'), h('div', {}, h('b', {}, 'Add screenshots of their page'), h('div', {class: 'tiny muted'}, 'Profile, about, posts — up to 8. Tap to pick, drag in, or paste (Ctrl+V).')), pickFiles),
+    thumbs,
+    h('div', {class: 'grid g2'}, field('Where', platform), field('Name', input('name', {placeholder: 'We read it from the page'})),
+      field('Their email', input('email', {type: 'email', placeholder: 'Optional — if you have it'})), field('Your notes', input('notes', {placeholder: 'Optional'}))),
+    h('div', {class: 'form-actions'}, h('button', {class: 'btn', type: 'submit'}, icon('zap'), 'Analyze & write opener')), status);
+  const onPaste = e => add([...(e.clipboardData?.files || [])]);
+  document.addEventListener('paste', onPaste);
+  const close0 = sheet('New chat from screenshots', 'The AI reads their page, your Sales Brain picks the principles, then it writes your first message.', form);
+  const close = () => { document.removeEventListener('paste', onPaste); close0(); };
+  new MutationObserver((_, obs) => { if (!document.body.contains(form)) { document.removeEventListener('paste', onPaste); obs.disconnect(); } }).observe(document.body, {childList: true});
+}
+function principlesBox(d) {
+  const box = h('div', {class: 'coach', style: 'margin-top:12px'});
+  if (!d.brain) return box.append(h('div', {class: 'k'}, 'Sales Brain'), h('div', {class: 'small'}, 'Not reached — this draft was written WITHOUT your principles. Check Settings → Sales Brain.')), box;
+  box.append(h('div', {class: 'k'}, 'Sales Brain principles used'));
+  for (const u of d.principles_used || []) box.append(h('div', {class: 'small', style: 'margin-top:6px'}, h('b', {}, u.principle || ''), u.how ? ' — ' + u.how : ''));
+  if (!(d.principles_used || []).length) box.append(h('div', {class: 'tiny muted'}, 'Pulled: ' + (d.principles || []).join(' · ')));
+  return box;
+}
+function emailSheet({to = '', subject = '', body = '', slug = '', lead = '', emails = [], draft, onSent}) {
+  const toIn = emails.length > 1 ? h('select', {}, emails.map(e => h('option', {value: e}, e))) : input('to', {type: 'email', value: to || emails[0] || ''});
+  const subj = input('subject', {value: subject, placeholder: 'Subject'}); const text = h('textarea', {rows: 12}, body);
+  const extra = h('div'); const status = h('div', {class: 'small', style: 'margin-top:8px'});
+  const send = h('button', {class: 'btn', onclick: async () => {
+    if (!confirm(`Send this email to ${toIn.value}?`)) return; send.disabled = true;
+    try { await api('/api/email/send', {to: toIn.value.trim(), subject: subj.value.trim(), body: text.value, slug, lead}); toast('Sent ✓'); close(); onSent && onSent(); }
+    catch (e) { toast(e.message, true); send.disabled = false; }
+  }}, icon('send'), 'Send');
+  const close = sheet(lead ? `Email ${lead}` : 'Send email', 'Goes from the email you connected in Settings.',
+    h('div', {class: 'stack'}, field('To', toIn), field('Subject', subj), field('Message', text), status, extra,
+      h('div', {class: 'form-actions'}, send, h('a', {class: 'small', href: '#/settings', onclick: () => close()}, 'Email settings'))));
+  if (draft) {
+    send.disabled = true; text.disabled = subj.disabled = true;
+    status.replaceChildren(h('span', {class: 'spin'}), ' Your Sales Brain + AI are writing it from everything we found… (1–2 min)');
+    draft().then(d => { subj.value = d.subject || ''; text.value = d.message || ''; extra.append(principlesBox(d)); status.textContent = ''; })
+      .catch(e => { status.textContent = 'Draft failed: ' + e.message; })
+      .finally(() => { send.disabled = text.disabled = subj.disabled = false; });
+  }
 }
 
 function jobItem(j) {
@@ -488,7 +564,9 @@ async function settings() {
   const grid = h('div', {class: 'grid g2'}); p.append(grid);
   for (const it of items) {
     const status = h('span', {class: 'pill ' + (it.connected ? 'on' : 'off')}, it.connected ? 'Connected' : 'Not connected');
-    const inputs = it.fields.map(f => input(f, {type: 'password', autocomplete: 'off', placeholder: it.values[f] || 'Paste key', 'aria-label': f}));
+    const secret = f => /KEY|TOKEN|SECRET|PASS/.test(f);
+    const inputs = it.fields.map(f => input(f, {type: secret(f) ? 'password' : 'text', autocomplete: 'off', 'aria-label': f,
+      placeholder: it.values[f] || {SMTP_USER: 'you@gmail.com', SMTP_PASS: 'App password', SMTP_FROM_NAME: 'Your name (signs emails)', SMTP_HOST: 'Optional: smtp.yourhost.com'}[f] || 'Paste key'}));
     const result = h('div', {class: 'small', style: 'margin-top:8px'});
     const save = h('button', {class: 'btn sm', onclick: async () => {
       const values = Object.fromEntries(inputs.map(i => [i.name, i.value.trim()]));

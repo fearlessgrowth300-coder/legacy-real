@@ -28,6 +28,7 @@ CLAUDE_MODEL=sonnet        # optional: sonnet / opus / haiku
 SALES_BRAIN_API_KEY=...    # Legacy Sales Coach principles
 SNOV_CLIENT_ID=... / SNOV_CLIENT_SECRET=...   # optional email lookup
 PAGESPEED_API_KEY=...      # optional speed grade
+SMTP_USER=... / SMTP_PASS=... / SMTP_FROM_NAME=...   # optional: send drafted emails from your mailbox (app password)
 ```
 
 Prospect data (reports, results, chats, jobs, caches) stays on the server and is git-ignored.

@@ -6,11 +6,13 @@ Every tool command runs as a background job with its own log and results file, o
 limits + RAM). Keys and prospect data stay on the server: .env, reports/, results/, chats/, jobs/ are never
 committed.
 """
-import csv, hashlib, hmac, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time
+import base64, csv, hashlib, hmac, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
-import urllib.request
+import smtplib, ssl, urllib.request
+from email.message import EmailMessage
+from email.utils import formataddr
 
 import maps_leads as m
 
@@ -39,11 +41,76 @@ INTEGRATIONS = [
     {"id": "snov", "name": "Snov.io", "fields": ["SNOV_CLIENT_ID", "SNOV_CLIENT_SECRET"],
      "powers": "Email lookup when an agent's website shows none",
      "get": "app.snov.io → Account → API"},
+    {"id": "email", "name": "Your email", "fields": ["SMTP_USER", "SMTP_PASS", "SMTP_FROM_NAME", "SMTP_HOST"],
+     "optional": ["SMTP_HOST"],
+     "powers": "Send the drafted emails to leads from your own address (Gmail, Outlook, Yahoo, iCloud, Zoho...)",
+     "get": "Gmail: myaccount.google.com → Security → 2-Step Verification → App passwords (use that, not your normal "
+            "password). SMTP_HOST only for custom domains, e.g. smtp.gmail.com for Google Workspace"},
     {"id": "pagespeed", "name": "Google PageSpeed", "fields": ["PAGESPEED_API_KEY"],
      "powers": "Mobile speed grade in audits",
      "get": "console.cloud.google.com → APIs → PageSpeed Insights API → Credentials"},
 ]
 EDITABLE = {f for i in INTEGRATIONS for f in i["fields"]}
+FIELD_PATTERNS = {"SMTP_USER": r"[^@\s,;<>]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "SMTP_FROM_NAME": r"[\w .,'&-]{2,60}",
+                  "SMTP_HOST": r"[A-Za-z0-9.-]{4,100}(:\d{2,5})?"}
+EMAIL = re.compile(r"[^@\s,;<>\"']{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+SMTP_HOSTS = {"gmail.com": "smtp.gmail.com", "googlemail.com": "smtp.gmail.com", "outlook.com": "smtp.office365.com",
+              "hotmail.com": "smtp.office365.com", "live.com": "smtp.office365.com", "yahoo.com": "smtp.mail.yahoo.com",
+              "icloud.com": "smtp.mail.me.com", "me.com": "smtp.mail.me.com", "zoho.com": "smtp.zoho.com"}
+SENT_FILE = os.path.join(HERE, "data", "sent.json")
+TASKS = {}  # id -> {"status": pending|done|error, ...}. ponytail: in-memory, a restart forgets unfinished ones
+
+
+def connected(integ):
+    return all(os.environ.get(f) for f in integ["fields"] if f not in integ.get("optional", []))
+
+
+def smtp_open():
+    user = os.environ["SMTP_USER"]
+    host = os.environ.get("SMTP_HOST") or SMTP_HOSTS.get(user.split("@")[1].lower(), "smtp." + user.split("@")[1])
+    host, _, port = host.partition(":")
+    port = int(port or 587)
+    server = smtplib.SMTP_SSL(host, port, timeout=30, context=ssl.create_default_context()) if port == 465 \
+        else smtplib.SMTP(host, port, timeout=30)
+    if port != 465:
+        server.starttls(context=ssl.create_default_context())
+    server.login(user, os.environ["SMTP_PASS"])
+    return server
+
+
+def send_email(to, subject, body):
+    msg = EmailMessage()
+    msg["From"] = formataddr((os.environ.get("SMTP_FROM_NAME", ""), os.environ["SMTP_USER"]))
+    msg["To"], msg["Subject"] = to, subject
+    msg.set_content(body)
+    with smtp_open() as server:
+        server.send_message(msg)
+
+
+def sent_log():
+    return json.load(open(SENT_FILE, encoding="utf-8")) if os.path.exists(SENT_FILE) else []
+
+
+def log_sent(entry):
+    with LOCK:
+        log = sent_log() + [entry]
+        os.makedirs(os.path.dirname(SENT_FILE), exist_ok=True)
+        with open(SENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=1)
+
+
+def run_task(fn, *args):
+    """Long AI work (30-120s) runs in a thread; the browser polls /api/tasks/<id> (proxies time out long requests)."""
+    task_id = secrets.token_hex(8)
+    TASKS[task_id] = {"status": "pending"}
+
+    def work():
+        try:
+            TASKS[task_id] = {"status": "done", **fn(*args)}
+        except Exception as e:
+            TASKS[task_id] = {"status": "error", "error": str(e)[:300]}
+    threading.Thread(target=work, daemon=True).start()
+    return {"task": task_id}
 
 
 # ---------------------------------------------------------------- accounts & settings
@@ -77,7 +144,7 @@ def set_env(key, value):
     lines = open(ENV_FILE, encoding="utf-8").read().splitlines() if os.path.exists(ENV_FILE) else []
     lines = [l for l in lines if not l.startswith(key + "=")]
     if value:
-        lines.append(f"{key}={value}")
+        lines.append(f"{key}={value}" if " " not in value else f'{key}="{value}"')
         os.environ[key] = value
     else:
         os.environ.pop(key, None)
@@ -115,6 +182,9 @@ def test_integration(iid):
                                 "client_secret": env["SNOV_CLIENT_SECRET"]}).encode()
             json.load(urllib.request.urlopen("https://api.snov.io/v1/oauth/access_token", body, 20))["access_token"]
             return True, "Snov.io accepted the keys"
+        if iid == "email":
+            smtp_open().quit()
+            return True, f"Signed in to your mailbox as {env['SMTP_USER']}"
         if iid == "pagespeed":
             url = ("https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=https://example.com&strategy=mobile"
                    f"&category=performance&key={env['PAGESPEED_API_KEY']}")
@@ -278,22 +348,78 @@ def save_chat(slug, chat):
         json.dump(chat, f, indent=1)
 
 
-def coach(name, report, turns, their_message):
+def as_text(item):
+    return item if isinstance(item, str) else " -- ".join(str(v) for v in item.values()) if isinstance(item, dict) \
+        else str(item)
+
+
+def chat_from_screens(paths, platform, name, notes, email):
+    """Screenshots of their page -> AI reads the person -> Sales Brain principles -> opener. Saved like a --person
+    report, so it shows up in Prospect Chat with coaching for every reply."""
+    profile = m.read_screenshots(paths, notes)
+    if not profile:
+        raise RuntimeError("The AI couldn't read the screenshots -- check Settings → AI engine, then try again")
+    name = name or str(profile.get("name") or "").strip() or "Unknown"
+    city = str(profile.get("city") or "").strip()
+    email = email or (str(profile.get("email") or "") if EMAIL.fullmatch(str(profile.get("email") or "")) else "")
+    facts = [f"{k}: {profile[k]}" for k in ("headline", "business", "city", "website", "phone", "email") if profile.get(k)]
+    facts += [as_text(f) for f in profile.get("facts") or []]
+    facts += [f"Visible gap: {as_text(g)}" for g in profile.get("problems") or []]
+    facts += [f"Possible opener: {as_text(h)}" for h in profile.get("hooks") or []]
+    if profile.get("who_they_are"):
+        facts.append(f"Who they are: {profile['who_they_are']}")
+    if notes:
+        facts.append(f"My notes: {notes}")
+    out = m.outreach(name, facts, f"{platform} DM")
+    used = "\n".join(f"- {u.get('principle', '')}: {u.get('how', '')}" for u in out["principles_used"])
+    report = (f"{name} | {city} | {time.ctime()}\n\nFACTS (read from their {platform} screenshots):\n"
+              + "\n".join(f"- {f}" for f in facts) + "\n\nSALES BRAIN PRINCIPLES:\n"
+              + ("\n".join(f"- {n}" for n in out["principles"]) or "- (Sales Brain not reached -- check Settings)")
+              + f"\n\nMESSAGES:\nMESSAGE 1\n{out.get('message', '')}\n\nMESSAGE 2 (after they reply)\n"
+              f"{out.get('followup', '')}\n\nPRINCIPLES USED:\n{used}\n")
+    os.makedirs(REPORTS, exist_ok=True)
+    slug = re.sub(r"\W+", "-", name).strip("-") or "Unknown"
+    with open(os.path.join(REPORTS, f"{slug}-{time.strftime('%Y-%m-%d-%H%M')}.txt"), "w", encoding="utf-8") as f:
+        f.write(report)
+    with LOCK:
+        chat = load_chat(slug)
+        chat.update(platform=platform, **({"email": email} if email else {}))
+        save_chat(slug, chat)
+    return {"slug": slug}
+
+
+def lead_row(file, name):
+    path = os.path.join(RESULTS, os.path.basename(file))
+    rows = list(csv.DictReader(open(path, encoding="utf-8"))) if os.path.exists(path) else []
+    return next((r for r in rows if r.get("Business Name") == name), None)
+
+
+def lead_email(row):
+    """Everything the tool proved about this lead -> Sales Brain -> an email draft."""
+    keep = ("Brokerage", "Address", "Website URL", "Sales (12 mo)", "Zillow Reviews", "Avg Price", "Expansion",
+            "Zillow Specialties", "Other Issues", "AI Review", "AI Visibility")
+    facts = [f"{k}: {row[k][:500]}" for k in keep if (row.get(k) or "").strip()]
+    facts += [f"Website check {k}: {row[k]}" for k in ("Schema", "Geo Pin", "Schema Data", "NAP", "H1")
+              if (row.get(k) or "").startswith(("FAIL", "PARTIAL"))]
+    return m.outreach(row["Business Name"], facts, "email", os.environ.get("SMTP_FROM_NAME", ""))
+
+
+def coach(name, report, turns, their_message, platform="LinkedIn"):
     """What they said -> what it means -> next goal -> reply, grounded in the report + Sales Brain."""
     history = [("agent" if t["role"] == "me" else "prospect", t["text"]) for t in turns]
     facts = report.split("SALES BRAIN PRINCIPLES:")[0][-6000:]
     principles = m.sales_brain(
-        f"I'm in a LinkedIn conversation with {name}, a real estate agent/broker I want as a client for my service "
+        f"I'm in a {platform} conversation with {name}, a real estate agent/broker I want as a client for my service "
         "(fixing how their website and listings are read by Google and AI assistants). They just replied: "
         f"\"{their_message}\". What is really going on in their reply and what should I say next?", history)
     convo = "\n".join(f"{'ME' if r == 'agent' else name.upper()}: {t}" for r, t in history)
     answer = m.gemini(
-        f"You coach me in a LinkedIn sales conversation with {name}.\n\nWHAT I KNOW ABOUT THEM (checked facts):\n"
+        f"You coach me in a {platform} sales conversation with {name}.\n\nWHAT I KNOW ABOUT THEM (checked facts):\n"
         f"{facts}\n\nCONVERSATION SO FAR:\n{convo}\n{name.upper()} (latest): {their_message}\n\n"
         "MY SALES TRAINING PRINCIPLES (from my own books/videos):\n" + "\n".join(principles) + "\n\n"
         "Return JSON with keys: said (their message in plain words, 1 sentence), meaning (what's really going on: "
         "tone, interest level, what they want, any objection or buying signal), next_goal (the one thing my next "
-        "message should achieve), reply (the exact message to send, natural LinkedIn style, max 90 words, no "
+        f"message should achieve), reply (the exact message to send, natural {platform} style, max 90 words, no "
         "jargon), why (which principle(s) you applied and how, 1-2 lines), watch_out (one thing NOT to say now). "
         "Rules: answer any direct question honestly first; if they clearly say no, respect it and leave the door "
         "open; use ONLY the checked facts, never invent numbers/results/urgency, never promise rankings in "
@@ -353,7 +479,7 @@ def dashboard():
     chats_active = sum(1 for s in everyone if load_chat(s)["turns"])
     return {"leads": sum(s["rows"] for s in sets), "scores": scores, "excellent": excellent,
             "people": len(everyone), "chats": chats_active, "running": RUNNING["id"],
-            "connected": {**{i["id"]: all(os.environ.get(f) for f in i["fields"]) for i in INTEGRATIONS},
+            "connected": {**{i["id"]: connected(i) for i in INTEGRATIONS},
                           **({"gemini": True} if m.use_claude() else {})},  # Claude does the AI work instead
             "recent_jobs": [job_meta(f[:-5]) for f in sorted(os.listdir(JOBS), reverse=True)
                             if f.endswith(".json")][:5] if os.path.isdir(JOBS) else []}
@@ -386,8 +512,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _body(self):
-        length = min(int(self.headers.get("Content-Length", 0)), 50000)
+    def _body(self, limit=50000):
+        length = int(self.headers.get("Content-Length", 0))
+        if length > limit:
+            raise ValueError("request too large")
         return json.loads(self.rfile.read(length) or b"{}")
 
     def _sign_in(self, name):
@@ -408,10 +536,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dashboard":
             return self._send(dashboard())
         if path == "/api/settings":
-            return self._send([{**i, "values": {f: mask(os.environ.get(f, "")) for f in i["fields"]},
-                                "connected": all(os.environ.get(f) for f in i["fields"])} for i in INTEGRATIONS])
+            return self._send([{**i, "values": {f: mask(os.environ.get(f, "")) if f not in FIELD_PATTERNS
+                                                else os.environ.get(f, "") for f in i["fields"]},
+                                "connected": connected(i)} for i in INTEGRATIONS])
         if path == "/api/ai":
             return self._send(ai_settings())
+        if match := re.fullmatch(r"/api/tasks/(\w+)", path):
+            return self._send(TASKS.get(match[1]) or {"status": "error", "error": "unknown task (server restarted?)"})
+        if path == "/api/sent":
+            return self._send(sent_log()[-500:])
         if path == "/api/status":
             return self._send({"running": RUNNING["id"], "apify": apify_usage()})
         if path == "/api/hot-zips":
@@ -506,14 +639,14 @@ class Handler(BaseHTTPRequestHandler):
                 for f in integ["fields"]:
                     set_env(f, None)
                 return self._send({"ok": True})
-            values = self._body()
-            for f in integ["fields"]:
-                v = str(values.get(f, "")).strip()
-                if v and (not re.fullmatch(r"[A-Za-z0-9_.\-:/+=]{8,300}", v)):
-                    return self._send({"error": f"{f} doesn't look like a valid key"}, 400)
-            for f in integ["fields"]:
-                if str(values.get(f, "")).strip():
-                    set_env(f, str(values[f]).strip())
+            values = {f: str(self._body().get(f, "")).strip() for f in integ["fields"]}
+            values = {f: v if f in ("SMTP_FROM_NAME",) else v.replace(" ", "") for f, v in values.items()}  # app passwords come spaced
+            for f, v in values.items():
+                if v and not re.fullmatch(FIELD_PATTERNS.get(f, r"[A-Za-z0-9_.\-:/+=]{8,300}"), v):
+                    return self._send({"error": f"{f} doesn't look right"}, 400)
+            for f, v in values.items():
+                if v:
+                    set_env(f, v)
             return self._send({"ok": True})
         if path == "/api/ai":  # which engine does all AI work: Gemini (API key) or Claude (subscription CLI)
             b = self._body()
@@ -531,6 +664,58 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"ok": "pong" in answer.lower(),
                                "message": f"{engine} answered" if "pong" in answer.lower()
                                else f"{engine} didn't answer -- check the server login / key, or usage limits"})
+        if path == "/api/chat/new":  # screenshots of their LinkedIn/Instagram/Facebook page -> a new chat
+            try:
+                b = self._body(12_000_000)
+            except ValueError:
+                return self._send({"error": "screenshots too large -- send fewer"}, 400)
+            platform = b.get("platform") if b.get("platform") in ("LinkedIn", "Instagram", "Facebook", "Other") else "Other"
+            try:
+                name, notes = clean(b.get("name")), str(b.get("notes") or "")[:2000]
+                email = clean(b.get("email"))
+            except ValueError as e:
+                return self._send({"error": str(e)}, 400)
+            if email and not EMAIL.fullmatch(email):
+                return self._send({"error": "that email doesn't look right"}, 400)
+            shots = [x for x in b.get("images") or [] if isinstance(x, str)][:8]
+            folder = os.path.join(HERE, "data", "screens", time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3))
+            os.makedirs(folder, exist_ok=True)
+            paths = []
+            for i, shot in enumerate(shots):
+                kind = re.match(r"data:image/(png|jpeg);base64,", shot)
+                if kind:
+                    paths.append(os.path.join(folder, f"{i + 1}.{'png' if kind[1] == 'png' else 'jpg'}"))
+                    with open(paths[-1], "wb") as f:
+                        f.write(base64.b64decode(shot[kind.end():]))
+            if not paths:
+                return self._send({"error": "add at least one screenshot (PNG or JPG)"}, 400)
+            return self._send(run_task(chat_from_screens, paths, platform, name, notes, email))
+        if path == "/api/email/draft":
+            b = self._body()
+            row = lead_row(str(b.get("file", "")), str(b.get("name", "")))
+            return self._send(run_task(lead_email, row)) if row else self._send({"error": "lead not found"}, 404)
+        if path == "/api/email/send":
+            b = self._body()
+            to, subject, text = str(b.get("to", "")).strip(), str(b.get("subject", "")).strip(), str(b.get("body", ""))
+            if not EMAIL.fullmatch(to) or "\n" in subject or not (0 < len(subject) <= 200) or not (0 < len(text) <= 8000):
+                return self._send({"error": "check the To address, subject and message"}, 400)
+            if not connected(next(i for i in INTEGRATIONS if i["id"] == "email")):
+                return self._send({"error": "connect your email in Settings first"}, 400)
+            try:
+                send_email(to, subject, text)
+            except Exception as e:
+                return self._send({"error": f"your mail server refused it: {str(e)[:160]}"}, 502)
+            slug = str(b.get("slug") or "")
+            log_sent({"to": to, "subject": subject, "at": time.strftime("%Y-%m-%d %H:%M"), "slug": slug,
+                      "lead": str(b.get("lead") or "")[:200]})
+            if slug in people():
+                with LOCK:
+                    chat = load_chat(slug)
+                    chat["email"] = to
+                    chat["turns"].append({"role": "me", "text": f"(email) {subject}\n\n{text}",
+                                          "at": time.strftime("%Y-%m-%d %H:%M")})
+                    save_chat(slug, chat)
+            return self._send({"ok": True})
         if match := re.fullmatch(r"/api/jobs/([\w-]+)/stop", path):
             return self._send({"ok": True}) if stop_job(match[1]) else self._send({"error": "that job isn't running"}, 400)
         if match := re.fullmatch(r"/api/jobs/(hunt|zips|person|audit|zillow)", path):
@@ -555,7 +740,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_chat(slug, chat)
             if match[2] == "theirs":
                 def work():
-                    result = coach(name, open(report_path, encoding="utf-8").read(), history, text)
+                    result = coach(name, open(report_path, encoding="utf-8").read(), history, text,
+                                   chat.get("platform", "LinkedIn"))
                     with LOCK:
                         latest = load_chat(slug)
                         latest["turns"][index]["coach"] = result
