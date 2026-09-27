@@ -9,7 +9,7 @@ committed.
 import base64, csv, hashlib, hmac, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlencode, urlparse, parse_qs, unquote
 import smtplib, ssl, urllib.request
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -41,7 +41,11 @@ INTEGRATIONS = [
     {"id": "snov", "name": "Snov.io", "fields": ["SNOV_CLIENT_ID", "SNOV_CLIENT_SECRET"],
      "powers": "Email lookup when an agent's website shows none",
      "get": "app.snov.io → Account → API"},
-    {"id": "email", "name": "Your email", "fields": ["SMTP_USER", "SMTP_PASS", "SMTP_FROM_NAME", "SMTP_HOST"],
+    {"id": "gmail", "name": "Gmail (sign in with Google)", "fields": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+     "extra": ["GMAIL_REFRESH_TOKEN", "GMAIL_ADDRESS"], "oauth": True,
+     "powers": "Send the drafted emails from your Gmail -- click Connect Gmail and approve, no passwords",
+     "get": "One-time: your own Google sign-in app (Client ID + Secret) -- steps in the chat / README"},
+    {"id": "email", "name": "Other email (app password)", "fields": ["SMTP_USER", "SMTP_PASS", "SMTP_FROM_NAME", "SMTP_HOST"],
      "optional": ["SMTP_HOST"],
      "powers": "Send the drafted emails to leads from your own address (Gmail, Outlook, Yahoo, iCloud, Zoho...)",
      "get": "Gmail: myaccount.google.com → Security → 2-Step Verification → App passwords (use that, not your normal "
@@ -52,7 +56,10 @@ INTEGRATIONS = [
 ]
 EDITABLE = {f for i in INTEGRATIONS for f in i["fields"]}
 FIELD_PATTERNS = {"SMTP_USER": r"[^@\s,;<>]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "SMTP_FROM_NAME": r"[\w .,'&-]{2,60}",
-                  "SMTP_HOST": r"[A-Za-z0-9.-]{4,100}(:\d{2,5})?"}
+                  "SMTP_HOST": r"[A-Za-z0-9.-]{4,100}(:\d{2,5})?",
+                  "GOOGLE_CLIENT_ID": r"[\w.-]{10,200}\.apps\.googleusercontent\.com"}
+APP_URL = os.environ.get("APP_URL", "https://legacy-real.vercel.app")  # where Google sends you back after Connect
+OAUTH_STATES = {}  # state -> time, proves the callback belongs to a Connect click from a signed-in user
 EMAIL = re.compile(r"[^@\s,;<>\"']{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 SMTP_HOSTS = {"gmail.com": "smtp.gmail.com", "googlemail.com": "smtp.gmail.com", "outlook.com": "smtp.office365.com",
               "hotmail.com": "smtp.office365.com", "live.com": "smtp.office365.com", "yahoo.com": "smtp.mail.yahoo.com",
@@ -78,11 +85,34 @@ def smtp_open():
     return server
 
 
+def google_token(params):
+    return json.load(urllib.request.urlopen("https://oauth2.googleapis.com/token", urlencode({
+        "client_id": os.environ["GOOGLE_CLIENT_ID"], "client_secret": os.environ["GOOGLE_CLIENT_SECRET"], **params}).encode(),
+        timeout=20))
+
+
+def gmail_access_token():
+    return google_token({"grant_type": "refresh_token", "refresh_token": os.environ["GMAIL_REFRESH_TOKEN"]})["access_token"]
+
+
+def email_ready():
+    return bool(os.environ.get("GMAIL_REFRESH_TOKEN") or connected(next(i for i in INTEGRATIONS if i["id"] == "email")))
+
+
 def send_email(to, subject, body):
+    """Gmail (signed in with Google) when connected, otherwise the app-password mailbox."""
+    gmail = os.environ.get("GMAIL_REFRESH_TOKEN")
     msg = EmailMessage()
-    msg["From"] = formataddr((os.environ.get("SMTP_FROM_NAME", ""), os.environ["SMTP_USER"]))
+    msg["From"] = formataddr((os.environ.get("SMTP_FROM_NAME", ""),
+                              os.environ["GMAIL_ADDRESS"] if gmail else os.environ["SMTP_USER"]))
     msg["To"], msg["Subject"] = to, subject
     msg.set_content(body)
+    if gmail:
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        urllib.request.urlopen(urllib.request.Request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", json.dumps({"raw": raw}).encode(),
+            {"Authorization": f"Bearer {gmail_access_token()}", "Content-Type": "application/json"}), timeout=30)
+        return
     with smtp_open() as server:
         server.send_message(msg)
 
@@ -182,6 +212,11 @@ def test_integration(iid):
                                 "client_secret": env["SNOV_CLIENT_SECRET"]}).encode()
             json.load(urllib.request.urlopen("https://api.snov.io/v1/oauth/access_token", body, 20))["access_token"]
             return True, "Snov.io accepted the keys"
+        if iid == "gmail":
+            if not env.get("GMAIL_REFRESH_TOKEN"):
+                return False, "Client saved -- now click Connect Gmail"
+            gmail_access_token()
+            return True, f"Signed in as {env.get('GMAIL_ADDRESS', '')} -- ready to send"
         if iid == "email":
             smtp_open().quit()
             return True, f"Signed in to your mailbox as {env['SMTP_USER']}"
@@ -348,6 +383,20 @@ def save_chat(slug, chat):
         json.dump(chat, f, indent=1)
 
 
+def save_screens(shots, tag):
+    """data:image/...;base64 strings from the browser -> files in data/screens/<folder>/ (max 8)."""
+    folder = time.strftime("%Y%m%d-%H%M%S-") + re.sub(r"\W+", "", tag)[:30] + secrets.token_hex(3)
+    paths = []
+    for shot in [x for x in shots or [] if isinstance(x, str)][:8]:
+        kind = re.match(r"data:image/(png|jpeg);base64,", shot)
+        if kind:
+            os.makedirs(os.path.join(HERE, "data", "screens", folder), exist_ok=True)
+            paths.append(os.path.join(HERE, "data", "screens", folder, f"{len(paths) + 1}.{'png' if kind[1] == 'png' else 'jpg'}"))
+            with open(paths[-1], "wb") as f:
+                f.write(base64.b64decode(shot[kind.end():]))
+    return paths
+
+
 def as_text(item):
     return item if isinstance(item, str) else " -- ".join(str(v) for v in item.values()) if isinstance(item, dict) \
         else str(item)
@@ -404,18 +453,23 @@ def lead_email(row):
     return m.outreach(row["Business Name"], facts, "email", os.environ.get("SMTP_FROM_NAME", ""))
 
 
-def coach(name, report, turns, their_message, platform="LinkedIn"):
+def coach(name, report, turns, their_message, platform="LinkedIn", images=(), note=""):
     """What they said -> what it means -> next goal -> reply, grounded in the report + Sales Brain."""
-    history = [("agent" if t["role"] == "me" else "prospect", t["text"]) for t in turns]
+    history = [("agent" if t["role"] == "me" else "prospect", t["text"] or "(sent a screenshot)") for t in turns]
     facts = report.split("SALES BRAIN PRINCIPLES:")[0][-6000:]
     principles = m.sales_brain(
         f"I'm in a {platform} conversation with {name}, a real estate agent/broker I want as a client for my service "
         "(fixing how their website and listings are read by Google and AI assistants). They just replied: "
-        f"\"{their_message}\". What is really going on in their reply and what should I say next?", history)
+        f"\"{their_message or '(a screenshot)'}\". " + (f"My goal: {note}. " if note else "")
+        + "What is really going on in their reply and what should I say next?", history)
     convo = "\n".join(f"{'ME' if r == 'agent' else name.upper()}: {t}" for r, t in history)
     answer = m.gemini(
         f"You coach me in a {platform} sales conversation with {name}.\n\nWHAT I KNOW ABOUT THEM (checked facts):\n"
-        f"{facts}\n\nCONVERSATION SO FAR:\n{convo}\n{name.upper()} (latest): {their_message}\n\n"
+        f"{facts}\n\nCONVERSATION SO FAR:\n{convo}\n{name.upper()} (latest): {their_message or '(see screenshots)'}\n\n"
+        + (f"I attached {len(images)} screenshot(s) (their reply, a post, their profile...): read them fully and use "
+           "what they show.\n" if images else "")
+        + (f"MY NOTE TO YOU (what I want -- do exactly this; the reply field is the message to send): {note}\n\n"
+           if note else "") +
         "MY SALES TRAINING PRINCIPLES (from my own books/videos):\n" + "\n".join(principles) + "\n\n"
         "Return JSON with keys: said (their message in plain words, 1 sentence), meaning (what's really going on: "
         "tone, interest level, what they want, any objection or buying signal), next_goal (the one thing my next "
@@ -425,7 +479,7 @@ def coach(name, report, turns, their_message, platform="LinkedIn"):
         "open; use ONLY the checked facts, never invent numbers/results/urgency, never promise rankings in "
         "Google or ChatGPT; don't state industry trends or how Google/AI choose who to recommend as facts (say "
         "what you found, not why it happens); don't pitch price until they show interest. 'said' must be a plain "
-        "paraphrase, not a copy of their words.", as_json=True)
+        "paraphrase, not a copy of their words.", as_json=True, images=images)
     try:
         out = json.loads(answer)
     except (ValueError, TypeError):
@@ -531,6 +585,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(open(os.path.join(HERE, "static", file), "rb").read(), kind=kind)
         if path == "/api/me":
             return self._send({"user": self._user(), "needs_setup": not users()})
+        if path == "/api/gmail/callback":
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            born = OAUTH_STATES.pop(q.get("state", ""), 0)
+            back = lambda result: self._send(b"", 302, headers=[("Location", f"{APP_URL}/#/settings?gmail={result}")])
+            if not born or time.time() - born > 900 or not q.get("code"):
+                return back("failed")
+            try:
+                tokens = google_token({"grant_type": "authorization_code", "code": q["code"],
+                                       "redirect_uri": f"{APP_URL}/api/gmail/callback"})
+                claims = json.loads(base64.urlsafe_b64decode(tokens["id_token"].split(".")[1] + "=="))
+                set_env("GMAIL_REFRESH_TOKEN", tokens["refresh_token"])
+                set_env("GMAIL_ADDRESS", claims["email"])
+                if claims.get("name") and not os.environ.get("SMTP_FROM_NAME"):
+                    set_env("SMTP_FROM_NAME", re.sub(r"[^\w .,'&-]", "", claims["name"])[:60])
+                return back("ok")
+            except Exception:
+                return back("failed")
         if not self._user():
             return self._send({"error": "sign in required"}, 401)
         if path == "/api/dashboard":
@@ -538,11 +609,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             return self._send([{**i, "values": {f: mask(os.environ.get(f, "")) if f not in FIELD_PATTERNS
                                                 else os.environ.get(f, "") for f in i["fields"]},
-                                "connected": connected(i)} for i in INTEGRATIONS])
+                                "connected": connected(i), "account": os.environ.get("GMAIL_ADDRESS", "")
+                                if i["id"] == "gmail" and os.environ.get("GMAIL_REFRESH_TOKEN") else ""}
+                               for i in INTEGRATIONS])
         if path == "/api/ai":
             return self._send(ai_settings())
         if match := re.fullmatch(r"/api/tasks/(\w+)", path):
             return self._send(TASKS.get(match[1]) or {"status": "error", "error": "unknown task (server restarted?)"})
+        if path == "/api/gmail/connect":
+            if not (os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET")):
+                return self._send({"error": "save the Google Client ID and Secret first"}, 400)
+            state = secrets.token_urlsafe(24)
+            OAUTH_STATES[state] = time.time()
+            return self._send({"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
+                "client_id": os.environ["GOOGLE_CLIENT_ID"], "redirect_uri": f"{APP_URL}/api/gmail/callback",
+                "response_type": "code", "access_type": "offline", "prompt": "consent", "state": state,
+                "scope": "openid email profile https://www.googleapis.com/auth/gmail.send"})})
+        if match := re.fullmatch(r"/api/screens/([\w-]+)/(\d+\.(?:jpg|png))", path):
+            file = os.path.join(HERE, "data", "screens", match[1], match[2])
+            return self._send(open(file, "rb").read(), kind="image/" + ("png" if file.endswith("png") else "jpeg")) \
+                if os.path.exists(file) else self._send({"error": "not found"}, 404)
         if path == "/api/sent":
             return self._send(sent_log()[-500:])
         if path == "/api/status":
@@ -636,7 +722,7 @@ class Handler(BaseHTTPRequestHandler):
                 ok, msg = test_integration(integ["id"])
                 return self._send({"ok": ok, "message": msg})
             if match[2] == "/remove":
-                for f in integ["fields"]:
+                for f in integ["fields"] + integ.get("extra", []):
                     set_env(f, None)
                 return self._send({"ok": True})
             values = {f: str(self._body().get(f, "")).strip() for f in integ["fields"]}
@@ -677,16 +763,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"error": str(e)}, 400)
             if email and not EMAIL.fullmatch(email):
                 return self._send({"error": "that email doesn't look right"}, 400)
-            shots = [x for x in b.get("images") or [] if isinstance(x, str)][:8]
-            folder = os.path.join(HERE, "data", "screens", time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3))
-            os.makedirs(folder, exist_ok=True)
-            paths = []
-            for i, shot in enumerate(shots):
-                kind = re.match(r"data:image/(png|jpeg);base64,", shot)
-                if kind:
-                    paths.append(os.path.join(folder, f"{i + 1}.{'png' if kind[1] == 'png' else 'jpg'}"))
-                    with open(paths[-1], "wb") as f:
-                        f.write(base64.b64decode(shot[kind.end():]))
+            paths = save_screens(b.get("images"), "new")
             if not paths:
                 return self._send({"error": "add at least one screenshot (PNG or JPG)"}, 400)
             return self._send(run_task(chat_from_screens, paths, platform, name, notes, email))
@@ -699,8 +776,8 @@ class Handler(BaseHTTPRequestHandler):
             to, subject, text = str(b.get("to", "")).strip(), str(b.get("subject", "")).strip(), str(b.get("body", ""))
             if not EMAIL.fullmatch(to) or "\n" in subject or not (0 < len(subject) <= 200) or not (0 < len(text) <= 8000):
                 return self._send({"error": "check the To address, subject and message"}, 400)
-            if not connected(next(i for i in INTEGRATIONS if i["id"] == "email")):
-                return self._send({"error": "connect your email in Settings first"}, 400)
+            if not email_ready():
+                return self._send({"error": "connect Gmail (or another email) in Settings first"}, 400)
             try:
                 send_email(to, subject, text)
             except Exception as e:
@@ -724,12 +801,21 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, RuntimeError) as e:
                 return self._send({"error": str(e)}, 400)
         if (match := re.fullmatch(r"/api/chat/([\w-]+)/(theirs|mine)", path)) and match[1] in people():
-            text = str(self._body().get("text", "")).strip()[:4000]
-            if not text:
-                return self._send({"error": "empty"}, 400)
+            try:
+                b = self._body(12_000_000)
+            except ValueError:
+                return self._send({"error": "screenshots too large -- send fewer"}, 400)
+            text, note = str(b.get("text", "")).strip()[:4000], str(b.get("note", "")).strip()[:2000]
+            paths = save_screens(b.get("images"), match[1]) if match[2] == "theirs" else []
+            if not (text or paths):
+                return self._send({"error": "type their reply or add a screenshot"}, 400)
             slug, (name, report_path) = match[1], people()[match[1]]
             turn = {"role": "me" if match[2] == "mine" else "them", "text": text,
                     "at": time.strftime("%Y-%m-%d %H:%M")}
+            if paths:
+                turn["images"] = [os.path.relpath(x, os.path.join(HERE, "data", "screens")).replace(os.sep, "/") for x in paths]
+            if note:
+                turn["note"] = note
             if match[2] == "theirs":
                 turn["coach"] = {"pending": True}  # 30-90s of AI work: answer now, fill in when done
             with LOCK:  # the background coach writes the same file
@@ -741,7 +827,7 @@ class Handler(BaseHTTPRequestHandler):
             if match[2] == "theirs":
                 def work():
                     result = coach(name, open(report_path, encoding="utf-8").read(), history, text,
-                                   chat.get("platform", "LinkedIn"))
+                                   chat.get("platform", "LinkedIn"), paths, note)
                     with LOCK:
                         latest = load_chat(slug)
                         latest["turns"][index]["coach"] = result

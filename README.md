@@ -40,3 +40,14 @@ Prospect data (reports, results, chats, jobs, caches) stays on the server and is
 - **Backend** — VPS behind Caddy (`https://2-25-126-125.sslip.io`, free Let's Encrypt certificate); the app itself
   listens on `127.0.0.1:8765` only. `deploy/autoupdate.sh` runs every minute (systemd `legacy-real-update.timer`),
   pulls new commits and restarts the app — skipped while a job is running.
+
+## Gmail "Connect" (one-time, ~5 min, free — no billing)
+
+Google requires every app that sends Gmail to have its own sign-in app. Create it once:
+
+1. console.cloud.google.com → create a project → **APIs & Services → Library** → enable **Gmail API**.
+2. **OAuth consent screen** → External → app name + your email → scopes: `gmail.send` → **Publish app** (so the
+   connection doesn't expire weekly; you'll see "Google hasn't verified this app" → Advanced → Continue — it's yours).
+3. **Credentials → Create credentials → OAuth client ID** → Web application → Authorized redirect URI:
+   `https://legacy-real.vercel.app/api/gmail/callback` → copy Client ID + Client secret.
+4. App → Settings → Gmail → paste both → Save → **Connect Gmail** → approve. Done; reconnect never needed.

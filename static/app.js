@@ -402,7 +402,9 @@ async function chat(slug) {
   const conv = h('div', {class: 'conv card'}); const mine = h('textarea', {placeholder: 'Your message (what you actually sent)'});
   if (!d.turns.length) conv.append(h('p', {class: 'small muted'}, 'Your first message is ready below — send it on LinkedIn, then tap "Log as sent".'));
   for (const t of d.turns) {
-    conv.append(h('div', {class: 'bubble ' + (t.role === 'me' ? 'me' : 'them')}, h('div', {class: 'meta'}, `${t.role === 'me' ? 'You' : d.name} · ${t.at || ''}`), t.text));
+    conv.append(h('div', {class: 'bubble ' + (t.role === 'me' ? 'me' : 'them')}, h('div', {class: 'meta'}, `${t.role === 'me' ? 'You' : d.name} · ${t.at || ''}`), t.text,
+      (t.images || []).length ? h('div', {class: 'thumbs', style: 'margin-top:8px'}, t.images.map(src => h('a', {class: 'thumb', href: '/api/screens/' + src, target: '_blank'}, h('img', {src: '/api/screens/' + src, alt: 'screenshot'})))) : null,
+      t.note ? h('div', {class: 'tiny muted', style: 'margin-top:6px'}, 'Your note to the AI: ' + t.note) : null));
     if (t.coach && t.coach.pending) {
       conv.append(h('div', {class: 'coach row'}, h('span', {class: 'spin'}), 'Reading their reply with your Sales Brain… (30–90s)'));
       clearTimeout(chatTimer); chatTimer = setTimeout(() => { if (location.hash === '#/chat/' + slug) route(); }, 4000);
@@ -420,17 +422,24 @@ async function chat(slug) {
     }
   }
   if (!d.turns.length) mine.value = d.first_message;
-  const theirs = h('textarea', {placeholder: `Paste what ${d.name} replied…`});
+  const theirs = h('textarea', {placeholder: `Paste what ${d.name} replied… (or just add a screenshot)`});
+  const note = input('note', {placeholder: 'Optional: tell the AI what you want, e.g. "write a comment on this post" or "they went quiet, re-open it"'});
+  const shots = imagePicker();
+  const attach = h('button', {class: 'btn secondary', type: 'button', onclick: () => shots.pick.click()}, icon('image'), 'Add screenshot', shots.pick);
   const analyze = h('button', {class: 'btn', onclick: async () => {
-    if (!theirs.value.trim()) return; analyze.disabled = true; analyze.replaceChildren(h('span', {class: 'spin'}), ' Reading their reply… (30–90s)');
-    try { await api(`/api/chat/${slug}/theirs`, {text: theirs.value}); route(); } catch (e) { toast(e.message, true); analyze.disabled = false; analyze.textContent = 'Break it down'; }
+    if (!theirs.value.trim() && !shots.files.length) return toast('Paste their reply or add a screenshot', true);
+    analyze.disabled = true; analyze.replaceChildren(h('span', {class: 'spin'}), ' Reading it… (30–90s)');
+    try { await api(`/api/chat/${slug}/theirs`, {text: theirs.value, note: note.value, images: await Promise.all(shots.files.map(shrink))}); route(); }
+    catch (e) { toast(e.message, true); analyze.disabled = false; analyze.textContent = 'Break it down'; }
   }}, icon('zap'), 'Break it down');
+  theirs.addEventListener('paste', e => shots.add([...(e.clipboardData?.files || [])]));
   const log = h('button', {class: 'btn secondary', onclick: async () => {
     if (!mine.value.trim()) return; await api(`/api/chat/${slug}/mine`, {text: mine.value}); toast('Logged'); route();
   }}, icon('send'), d.turns.length ? 'Log my message' : 'Log as sent');
   const byEmail = h('button', {class: 'btn secondary', onclick: () => emailSheet({to: d.email || '', body: mine.value, slug, lead: d.name, onSent: route})}, icon('mail'), 'Send by email');
   thread.append(header, conv, h('div', {class: 'composer'}, h('div', {class: 'card'},
-    field('Their reply', theirs), h('div', {class: 'form-actions', style: 'margin-top:10px'}, analyze),
+    field('Their reply', theirs), shots.thumbs, h('div', {style: 'margin-top:10px'}, field('Note to the AI', note)),
+    h('div', {class: 'form-actions', style: 'margin-top:10px'}, analyze, attach),
     h('div', {class: 'divider'}), field('Your message', mine), h('div', {class: 'form-actions', style: 'margin-top:10px'}, log, byEmail),
     d.email ? h('p', {class: 'tiny muted', style: 'margin-top:6px'}, 'Email: ' + d.email) : null)));
 }
@@ -444,12 +453,16 @@ async function shrink(file) {  // phone screenshots are huge: keep text readable
   const c = h('canvas', {width: Math.round(img.width * k), height: Math.round(img.height * k)});
   c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); return c.toDataURL('image/jpeg', 0.82);
 }
-function newChat() {
+function imagePicker() {  // {files, thumbs, pick (hidden input), add(list), clear()}
   const files = []; const thumbs = h('div', {class: 'thumbs'});
-  const pickFiles = h('input', {type: 'file', accept: 'image/*', multiple: true, style: 'display:none', onchange: () => { add([...pickFiles.files]); pickFiles.value = ''; }});
-  const drawThumbs = () => { thumbs.replaceChildren(...files.map((f, i) => h('div', {class: 'thumb'}, h('img', {src: URL.createObjectURL(f), alt: ''}),
-    h('button', {type: 'button', 'aria-label': 'Remove', onclick: () => { files.splice(i, 1); drawThumbs(); }}, icon('x'))))); };
-  const add = list => { for (const f of list) if (f.type.startsWith('image/') && files.length < 8) files.push(f); drawThumbs(); };
+  const pick = h('input', {type: 'file', accept: 'image/*', multiple: true, style: 'display:none', onchange: () => { add([...pick.files]); pick.value = ''; }});
+  const draw = () => { thumbs.replaceChildren(...files.map((f, i) => h('div', {class: 'thumb'}, h('img', {src: URL.createObjectURL(f), alt: ''}),
+    h('button', {type: 'button', 'aria-label': 'Remove', onclick: () => { files.splice(i, 1); draw(); }}, icon('x'))))); };
+  const add = list => { for (const f of list) if (f.type.startsWith('image/') && files.length < 8) files.push(f); draw(); };
+  return {files, thumbs, pick, add, clear: () => { files.length = 0; draw(); }};
+}
+function newChat() {
+  const {files, thumbs, pick: pickFiles, add} = imagePicker();
   const platform = h('select', {name: 'platform'}, ['LinkedIn', 'Instagram', 'Facebook', 'Other'].map(v => h('option', {value: v}, v)));
   const status = h('div', {class: 'small', style: 'margin-top:10px'});
   const form = h('form', {class: 'stack', onsubmit: async e => {
@@ -557,13 +570,18 @@ async function reports() {
   q.oninput = draw; draw();
 }
 
-async function settings() {
+async function settings(_, params) {
+  if (params && params.get('gmail')) { toast(params.get('gmail') === 'ok' ? 'Gmail connected ✓' : 'Gmail connection failed — try Connect again', params.get('gmail') !== 'ok'); history.replaceState(null, '', '#/settings'); }
   const p = page('Settings', 'Connect the services the app uses. Keys are stored only on your server.');
   const [items, ai] = await Promise.all([api('/api/settings'), api('/api/ai')]);
   p.append(h('h2', {style: 'margin:4px 0 12px'}, 'AI engine'), aiEngine(ai), h('h2', {style: 'margin:28px 0 12px'}, 'Integrations'));
   const grid = h('div', {class: 'grid g2'}); p.append(grid);
   for (const it of items) {
-    const status = h('span', {class: 'pill ' + (it.connected ? 'on' : 'off')}, it.connected ? 'Connected' : 'Not connected');
+    const live = it.oauth ? !!it.account : it.connected;
+    const status = h('span', {class: 'pill ' + (live ? 'on' : 'off')}, it.oauth ? (it.account ? 'Connected' : it.connected ? 'Ready — click Connect Gmail' : 'Not connected') : (it.connected ? 'Connected' : 'Not connected'));
+    const connectBtn = it.oauth ? h('button', {class: 'btn sm', disabled: !it.connected, onclick: async () => {
+      try { location.href = (await api('/api/gmail/connect')).url; } catch (e) { toast(e.message, true); }
+    }}, icon('mail'), it.account ? 'Reconnect Gmail' : 'Connect Gmail') : null;
     const secret = f => /KEY|TOKEN|SECRET|PASS/.test(f);
     const inputs = it.fields.map(f => input(f, {type: secret(f) ? 'password' : 'text', autocomplete: 'off', 'aria-label': f,
       placeholder: it.values[f] || {SMTP_USER: 'you@gmail.com', SMTP_PASS: 'App password', SMTP_FROM_NAME: 'Your name (signs emails)', SMTP_HOST: 'Optional: smtp.yourhost.com'}[f] || 'Paste key'}));
@@ -582,8 +600,9 @@ async function settings() {
     }}, 'Remove');
     grid.append(h('div', {class: 'card'},
       h('div', {class: 'card-head'}, h('div', {class: 'row'}, h('div', {class: 'icon-box'}, icon('plug')), h('h2', {}, it.name)), status),
-      h('p', {class: 'small muted'}, it.powers), h('p', {class: 'tiny muted', style: 'margin:6px 0 12px'}, 'Get it: ' + it.get),
-      h('div', {class: 'stack'}, ...inputs), h('div', {class: 'form-actions', style: 'margin-top:12px'}, save, test, remove), result));
+      h('p', {class: 'small muted'}, it.powers), it.account ? h('p', {class: 'small', style: 'margin-top:6px'}, 'Sending as ', h('b', {}, it.account)) : null,
+      h('p', {class: 'tiny muted', style: 'margin:6px 0 12px'}, 'Get it: ' + it.get),
+      h('div', {class: 'stack'}, ...inputs), h('div', {class: 'form-actions', style: 'margin-top:12px'}, connectBtn, save, test, remove), result));
   }
   const cur = input('current', {type: 'password', autocomplete: 'current-password'}), nw = input('new', {type: 'password', autocomplete: 'new-password'});
   p.append(h('h2', {style: 'margin:28px 0 12px'}, 'Account'), h('div', {class: 'grid g2'},
@@ -663,6 +682,16 @@ async function pollStatus() {
     lastRunning = s.running;
   } catch (e) { /* signed out or offline */ }
 }
-function start() { renderShell(); route(); pollStatus(); }
+let appTag = null;
+async function checkUpdate() {  // the app stays open for days on a phone: offer a refresh when a new version ships
+  try {
+    const r = await fetch('/app.js', {method: 'HEAD', cache: 'no-store'}); const tag = r.headers.get('etag') || r.headers.get('last-modified');
+    if (appTag && tag && tag !== appTag && !document.querySelector('.update-bar'))
+      document.body.append(h('button', {class: 'update-bar', onclick: () => location.reload()}, 'New version available — tap to refresh'));
+    appTag = appTag || tag;
+  } catch (e) { /* offline */ }
+}
+setInterval(checkUpdate, 60000);
+function start() { renderShell(); route(); pollStatus(); checkUpdate(); }
 setInterval(pollStatus, 6000);
 api('/api/me').then(r => { state.me = r.user; if (r.user) start(); else renderAuth(r.needs_setup); }).catch(() => renderAuth());
