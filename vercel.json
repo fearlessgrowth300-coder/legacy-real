@@ -5,7 +5,7 @@
   "installCommand": "",
   "outputDirectory": "static",
   "rewrites": [
-    { "source": "/api/:path*", "destination": "http://2.25.126.125:8765/api/:path*" }
+    { "source": "/api/:path*", "destination": "https://2-25-126-125.sslip.io/api/:path*" }
   ],
   "headers": [
     {

@@ -209,7 +209,14 @@ def start_job(kind, params):
 
 
 def mark_interrupted():
-    """Jobs that were running when the server restarted can't be resumed -- say so instead of 'running' forever."""
+    """Jobs / chat analyses that were running when the server restarted can't be resumed -- say so."""
+    for f in os.listdir(CHATS) if os.path.isdir(CHATS) else []:
+        chat = load_chat(f[:-5])
+        stuck = [t for t in chat["turns"] if (t.get("coach") or {}).get("pending")]
+        for t in stuck:
+            t["coach"] = {"reply": "(The server restarted during this analysis -- paste their reply again.)"}
+        if stuck:
+            save_chat(f[:-5], chat)
     for f in os.listdir(JOBS) if os.path.isdir(JOBS) else []:
         if f.endswith(".json"):
             meta = json.load(open(os.path.join(JOBS, f), encoding="utf-8"))
@@ -522,4 +529,5 @@ if __name__ == "__main__":
         sys.exit("Set APP_KEY (16+ random characters) in .env -- it's the one-time setup code for your account")
     mark_interrupted()
     print(f"Legacy Real on port {PORT}")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    # on the VPS APP_HOST=127.0.0.1: only Caddy (https) can reach the app, the plain port stays closed
+    ThreadingHTTPServer((os.environ.get("APP_HOST", "0.0.0.0"), PORT), Handler).serve_forever()
