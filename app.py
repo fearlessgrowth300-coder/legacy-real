@@ -6,7 +6,7 @@ Every tool command runs as a background job with its own log and results file, o
 limits + RAM). Keys and prospect data stay on the server: .env, reports/, results/, chats/, jobs/ are never
 committed.
 """
-import csv, hashlib, hmac, json, os, re, secrets, subprocess, sys, threading, time
+import csv, hashlib, hmac, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
@@ -21,7 +21,8 @@ m.load_env_file(ENV_FILE)
 APP_KEY = os.environ.get("APP_KEY") or os.environ.get("CHAT_TOKEN", "")  # one-time setup code for the first account
 PORT = int(os.environ.get("APP_PORT", os.environ.get("CHAT_PORT", "8765")))
 SESSIONS = {}  # sid -> username. ponytail: in-memory, a server restart = sign in again
-RUNNING = {"id": None}
+RUNNING = {"id": None, "proc": None, "stopped": False}
+AI_MODELS = {"claude": ["", "sonnet", "opus", "haiku"]}  # "" = the CLI's default for the plan
 LOCK = threading.Lock()
 
 # Keys the Settings page may add/replace/remove (nothing else in .env is reachable from the web)
@@ -193,19 +194,40 @@ def start_job(kind, params):
     save_meta(meta)
     log = open(os.path.join(JOBS, job_id + ".log"), "w", encoding="utf-8")
     env = {**os.environ, "HEADLESS": "1", "LEADS_OUT": out, "PYTHONUNBUFFERED": "1"}
+    # own process group, so Stop also kills its browser and claude children
     proc = subprocess.Popen([sys.executable, os.path.join(HERE, "maps_leads.py"), *args], cwd=HERE, env=env,
-                            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    RUNNING.update(proc=proc, stopped=False)
 
     def wait():
         code = proc.wait()
         log.close()
-        meta.update(status="done" if code == 0 else "failed", exit=code, ended=time.strftime("%Y-%m-%d %H:%M"),
+        status = "stopped" if RUNNING["stopped"] else "done" if code == 0 else "failed"
+        meta.update(status=status, exit=code, ended=time.strftime("%Y-%m-%d %H:%M"),
                     results=os.path.basename(out) if os.path.exists(out) else None)
         save_meta(meta)
-        RUNNING["id"] = None
+        RUNNING.update(id=None, proc=None)
 
     threading.Thread(target=wait, daemon=True).start()
     return meta
+
+
+def stop_job(job_id):
+    proc = RUNNING["proc"]
+    if RUNNING["id"] != job_id or not proc:
+        return False
+    RUNNING["stopped"] = True
+    try:
+        os.killpg(proc.pid, signal.SIGTERM) if hasattr(os, "killpg") else proc.terminate()
+    except ProcessLookupError:
+        pass
+    return True
+
+
+def ai_settings():
+    return {"provider": "claude" if m.use_claude() else "gemini", "model": os.environ.get("CLAUDE_MODEL", ""),
+            "models": AI_MODELS["claude"], "claude_installed": bool(shutil.which("claude")),
+            "gemini_connected": bool(os.environ.get("GEMINI_API_KEY"))}
 
 
 def mark_interrupted():
@@ -331,7 +353,8 @@ def dashboard():
     chats_active = sum(1 for s in everyone if load_chat(s)["turns"])
     return {"leads": sum(s["rows"] for s in sets), "scores": scores, "excellent": excellent,
             "people": len(everyone), "chats": chats_active, "running": RUNNING["id"],
-            "connected": {i["id"]: all(os.environ.get(f) for f in i["fields"]) for i in INTEGRATIONS},
+            "connected": {**{i["id"]: all(os.environ.get(f) for f in i["fields"]) for i in INTEGRATIONS},
+                          **({"gemini": True} if m.use_claude() else {})},  # Claude does the AI work instead
             "recent_jobs": [job_meta(f[:-5]) for f in sorted(os.listdir(JOBS), reverse=True)
                             if f.endswith(".json")][:5] if os.path.isdir(JOBS) else []}
 
@@ -387,6 +410,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             return self._send([{**i, "values": {f: mask(os.environ.get(f, "")) for f in i["fields"]},
                                 "connected": all(os.environ.get(f) for f in i["fields"])} for i in INTEGRATIONS])
+        if path == "/api/ai":
+            return self._send(ai_settings())
         if path == "/api/status":
             return self._send({"running": RUNNING["id"], "apify": apify_usage()})
         if path == "/api/hot-zips":
@@ -490,6 +515,24 @@ class Handler(BaseHTTPRequestHandler):
                 if str(values.get(f, "")).strip():
                     set_env(f, str(values[f]).strip())
             return self._send({"ok": True})
+        if path == "/api/ai":  # which engine does all AI work: Gemini (API key) or Claude (subscription CLI)
+            b = self._body()
+            provider, model = b.get("provider"), str(b.get("model") or "")
+            if provider not in ("gemini", "claude") or model not in AI_MODELS["claude"]:
+                return self._send({"error": "unknown engine or model"}, 400)
+            if provider == "claude" and not shutil.which("claude"):
+                return self._send({"error": "Claude Code isn't installed on the server"}, 400)
+            set_env("AI_PROVIDER", provider if provider == "claude" else None)
+            set_env("CLAUDE_MODEL", model or None)
+            return self._send(ai_settings())
+        if path == "/api/ai/test":
+            engine = "Claude" if m.use_claude() else "Gemini"
+            answer = m.gemini("Reply with exactly the word: pong")
+            return self._send({"ok": "pong" in answer.lower(),
+                               "message": f"{engine} answered" if "pong" in answer.lower()
+                               else f"{engine} didn't answer -- check the server login / key, or usage limits"})
+        if match := re.fullmatch(r"/api/jobs/([\w-]+)/stop", path):
+            return self._send({"ok": True}) if stop_job(match[1]) else self._send({"error": "that job isn't running"}, 400)
         if match := re.fullmatch(r"/api/jobs/(hunt|zips|person|audit|zillow)", path):
             try:
                 return self._send(start_job(match[1], self._body()))

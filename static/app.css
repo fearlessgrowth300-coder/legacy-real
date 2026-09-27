@@ -90,7 +90,7 @@ textarea { min-height: 96px; resize: vertical; }
 .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 99px; background: var(--surface-2); color: var(--ink-2); white-space: nowrap; }
 .pill.EXCELLENT, .pill.done, .pill.PASS, .pill.on { background: var(--good-bg); color: var(--good); }
 .pill.OKAY, .pill.running, .pill.PARTIAL, .pill.CHECK { background: var(--warn-bg); color: var(--warn); }
-.pill.POOR, .pill.failed, .pill.interrupted, .pill.FAIL, .pill.off { background: var(--bad-bg); color: var(--bad); }
+.pill.POOR, .pill.failed, .pill.interrupted, .pill.stopped, .pill.FAIL, .pill.off { background: var(--bad-bg); color: var(--bad); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 .pulse .dot { animation: pulse 1.2s infinite; } @keyframes pulse { 50% { opacity: .3; } }
 .chips { display: flex; gap: 8px; flex-wrap: wrap; }

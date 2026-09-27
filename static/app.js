@@ -414,7 +414,11 @@ function openJob(id) {
       if (j.results) actions.append(h('a', {class: 'btn sm', href: `#/leads?file=${esc(j.results)}`, onclick: close}, 'Open leads'));
       if (j.type === 'person') actions.append(h('a', {class: 'btn sm', href: '#/chat', onclick: close}, 'Open chat'));
       if (j.type === 'audit') actions.append(h('a', {class: 'btn secondary sm', href: '#/reports', onclick: close}, 'Reports'));
-    } else if (!actions.firstChild) actions.append(h('span', {class: 'pill running pulse'}, h('span', {class: 'dot'}), 'running'));
+    } else if (!actions.firstChild) actions.append(h('span', {class: 'pill running pulse'}, h('span', {class: 'dot'}), 'running'),
+      h('button', {class: 'btn danger sm', onclick: async e => {
+        if (!confirm('Stop this job? Leads found so far are kept if the sheet was already saved.')) return;
+        e.currentTarget.disabled = true; try { await api(`/api/jobs/${id}/stop`, {}); toast('Stopping…'); } catch (err) { toast(err.message, true); }
+      }}, 'Stop job'));
   };
   clearInterval(logTimer); tick(); logTimer = setInterval(tick, 3000);
 }
@@ -435,8 +439,8 @@ async function reports() {
 
 async function settings() {
   const p = page('Settings', 'Connect the services the app uses. Keys are stored only on your server.');
-  const items = await api('/api/settings');
-  p.append(h('h2', {style: 'margin:4px 0 12px'}, 'Integrations'));
+  const [items, ai] = await Promise.all([api('/api/settings'), api('/api/ai')]);
+  p.append(h('h2', {style: 'margin:4px 0 12px'}, 'AI engine'), aiEngine(ai), h('h2', {style: 'margin:28px 0 12px'}, 'Integrations'));
   const grid = h('div', {class: 'grid g2'}); p.append(grid);
   for (const it of items) {
     const status = h('span', {class: 'pill ' + (it.connected ? 'on' : 'off')}, it.connected ? 'Connected' : 'Not connected');
@@ -467,6 +471,29 @@ async function settings() {
     h('div', {class: 'card'}, h('h2', {style: 'margin-bottom:8px'}, `Signed in as ${state.me}`),
       h('p', {class: 'small muted'}, 'Signing out ends every session of this account.'),
       h('div', {class: 'form-actions'}, h('button', {class: 'btn secondary', onclick: async () => { await api('/api/logout', {}); state.me = null; renderAuth(); }}, icon('logout'), 'Sign out')))));
+}
+
+function aiEngine(ai) {
+  const save = async body => { try { await api('/api/ai', body); toast('AI engine saved'); settings(); } catch (e) { toast(e.message, true); } };
+  const seg = h('div', {class: 'seg', role: 'group'},
+    ...[['gemini', 'Gemini (API key)'], ['claude', 'Claude (your subscription)']].map(([id, label]) =>
+      h('button', {type: 'button', 'aria-pressed': String(ai.provider === id), onclick: () => save({provider: id, model: ai.model})}, label)));
+  const model = h('select', {'aria-label': 'Claude model', onchange: () => save({provider: 'claude', model: model.value})},
+    ai.models.map(v => h('option', {value: v, selected: v === ai.model}, v ? v[0].toUpperCase() + v.slice(1) : 'Default for my plan')));
+  const result = h('div', {class: 'small', style: 'margin-top:8px'});
+  const test = h('button', {class: 'btn secondary sm', onclick: async () => {
+    test.disabled = true; result.replaceChildren(h('span', {class: 'spin'}), ' Asking…');
+    const r = await api('/api/ai/test', {}).catch(e => ({ok: false, message: e.message}));
+    result.replaceChildren(h('span', {class: 'pill ' + (r.ok ? 'on' : 'off')}, r.ok ? 'Working' : 'Problem'), ' ', r.message); test.disabled = false;
+  }}, icon('check'), 'Test');
+  const claude = ai.provider === 'claude';
+  return h('div', {class: 'card'},
+    h('p', {class: 'small muted', style: 'margin-bottom:12px'}, 'Does the AI Review, AI Visibility, messages and chat coaching. Switch any time — the next job uses it.'),
+    seg,
+    claude ? h('div', {class: 'stack', style: 'margin-top:12px'}, field('Model', model),
+      h('p', {class: 'tiny muted'}, ai.claude_installed ? 'Runs through Claude Code logged in on your server with your Claude plan — no API key. Uses your plan’s usage limits; a big hunt makes many calls.' : 'Claude Code is not installed on the server.'))
+      : h('p', {class: 'tiny muted', style: 'margin-top:12px'}, ai.gemini_connected ? 'Uses your Gemini key below.' : 'Connect a Gemini key below first.'),
+    h('div', {class: 'form-actions', style: 'margin-top:12px'}, test), result);
 }
 
 async function more() {

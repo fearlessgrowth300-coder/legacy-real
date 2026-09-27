@@ -522,8 +522,51 @@ def snov_emails(site):
     return []
 
 
+def use_claude():
+    return os.environ.get("AI_PROVIDER") == "claude"
+
+
+def ai_ready():
+    """Is an AI engine set up? Claude = the logged-in Claude Code CLI (subscription), Gemini = an API key."""
+    return use_claude() or bool(os.environ.get("GEMINI_API_KEY"))
+
+
+def claude_cli(prompt, search=False, as_json=False):
+    """One call through the Claude Code CLI logged in with the user's Claude subscription -- no API key.
+    search=True lets it use its WebSearch tool; otherwise all tools are off. Prompt goes in on stdin."""
+    cmd = ["claude", "-p", "--output-format", "json", "--no-session-persistence",
+           "--tools", "WebSearch" if search else ""]
+    if search:
+        cmd += ["--allowedTools", "WebSearch"]
+    if os.environ.get("CLAUDE_MODEL"):
+        cmd += ["--model", os.environ["CLAUDE_MODEL"]]
+    if as_json:
+        prompt += "\n\nReply with ONLY the JSON, no other text."
+    for attempt in range(2):
+        try:
+            run = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300,
+                                 cwd=tempfile.gettempdir(), encoding="utf-8")
+            data = json.loads(run.stdout or "{}")
+            if data.get("is_error") or "result" not in data:
+                print(f"  claude error: {' '.join(str(data.get('result') or run.stderr or run.stdout).split())[:160]}")
+                if "limit" in str(data.get("result", "")).lower():  # subscription usage window used up
+                    return ""
+                continue
+            text = data["result"].strip()
+            if as_json:  # strip ```json fences / chatter around the JSON
+                found = re.search(r"[\[{].*[\]}]", text, re.S)
+                text = found.group(0) if found else text
+            return text
+        except Exception as e:
+            print(f"  claude error: {e}{', retrying' if attempt == 0 else ''}")
+    return ""
+
+
 def gemini(prompt, search=False, as_json=False):
-    """One Gemini call; search=True grounds it in live Google Search (what AI answers actually say today)."""
+    """One AI call; search=True grounds it in live web search (what AI answers actually say today).
+    Goes to Claude instead when AI_PROVIDER=claude (Settings -> AI engine)."""
+    if use_claude():
+        return claude_cli(prompt, search, as_json)
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         return ""
@@ -636,10 +679,11 @@ def ask_ai(question):
     if question not in _visibility_cache:
         # live Google Search grounding needs a paid plan; without it, ask what Gemini itself knows
         answer = "" if _visibility_cache.get("_no_search") else gemini(question, search=True)
-        how = "Gemini + Google Search"
+        engine = "Claude" if use_claude() else "Gemini"
+        how = f"{engine} + {'web' if use_claude() else 'Google'} search"
         if not answer:
             _visibility_cache["_no_search"] = True
-            answer, how = gemini(question), "Gemini's own knowledge, no live search"
+            answer, how = gemini(question), f"{engine}'s own knowledge, no live search"
         _visibility_cache[question] = (answer, how)
     return _visibility_cache[question]
 
@@ -768,7 +812,7 @@ def condensed_source(html, limit=60000):
 def ai_review(html, place, grades):
     """Gemini reads the page source for issues the fixed checks don't cover.
     Every issue must quote code as evidence; issues whose quote isn't really in the source are dropped."""
-    if not html or not os.environ.get("GEMINI_API_KEY"):
+    if not html or not ai_ready():
         return ""
     already = "\n".join(f"{c}: {g}" for c, g in grades.items() if g)
     answer = gemini(
@@ -800,7 +844,7 @@ def add_ai(place, grades, pitch=True):
     city = city_of(place.get("formattedAddress", ""))
     if city:  # the questions to paste into ChatGPT need no AI key
         grades["Test in ChatGPT"] = "\n".join(buyer_questions(city, specialties(html)))
-    if not (os.environ.get("GEMINI_API_KEY") and name):
+    if not (ai_ready() and name):
         return
     grades["AI Review"] = ai_review(html, place, grades)
     grades["AI Visibility"], grades["Test in ChatGPT"] = ai_visibility(name, city_of(place.get("formattedAddress", "")),
@@ -1230,7 +1274,7 @@ def person(args):
         if not grades and g.get("_html"):
             grades = g  # the first readable site feeds the AI steps
 
-    print("4. Gemini: AI Review + Question Matrix")
+    print("4. AI: AI Review + Question Matrix")
     grades.setdefault("_html", "")
     add_ai(place, grades, pitch=False)  # AI Review, AI Visibility, questions (the messages are written below)
     for key in ("AI Review", "AI Visibility"):
@@ -1265,7 +1309,7 @@ def person(args):
         "or the domain does not exist. No URLs in backticks; no technical words like DNS, subdomain, bot-challenge. "
         "Anything marked '1 source, verify' must not be stated as fact to them (say 'some sites still show...'). "
         "After the messages, list which principle you used for each line.\n\nFACTS:\n" + fact_text +
-        "\n\nMY SALES TRAINING PRINCIPLES:\n" + "\n".join(principles)) if os.environ.get("GEMINI_API_KEY") else ""
+        "\n\nMY SALES TRAINING PRINCIPLES:\n" + "\n".join(principles)) if ai_ready() else ""
     report = (f"{name} | {city} | {time.ctime()}\n\nFACTS (checked by the tool):\n{fact_text}\n\n"
               f"TEST IN CHATGPT:\n{grades.get('Test in ChatGPT', '')}\n\n"
               f"SALES BRAIN PRINCIPLES:\n" + "\n".join(p[:220] for p in principles) + f"\n\nMESSAGES:\n{messages}\n")
@@ -1392,8 +1436,8 @@ def build_sheet(places):
     with ThreadPoolExecutor(4) as pool:  # more parallel = small hosts drop connections
         emails, socials = map(list, zip(*pool.map(find_contacts, [p.get("websiteUri", "") for _, p in places]))) if places else ([], [])
         audits = list(pool.map(audit_site, [p for _, p in places]))
-    if os.environ.get("GEMINI_API_KEY"):
-        print("asking Gemini: AI review of page sources, AI visibility per city, drafting pitches...")
+    if ai_ready():
+        print("asking AI: AI review of page sources, AI visibility per city, drafting pitches...")
     for (_, p), g in zip(places, audits):  # sequential: free-tier rate limits
         add_ai(p, g)
     sources = ["website" if e else "" for e in emails]
@@ -1475,6 +1519,11 @@ if __name__ == "__main__":
     assert ai_review(page, {}, {}) == ('script tag pasted inside JS [evidence: function runPageScript(){ '
                                        '<script type="application/ld+json">]'), "hallucination gate broken"
     gemini = real_gemini
+    real_run = subprocess.run  # Claude CLI output with ```json fences -> bare JSON
+    subprocess.run = lambda *a, **k: type("R", (), {"stdout": json.dumps({"result": 'Sure:\n```json\n[{"a": 1}]\n```'}),
+                                                     "stderr": ""})()
+    assert json.loads(claude_cli("x", as_json=True)) == [{"a": 1}], "claude JSON extraction broken"
+    subprocess.run = real_run
     if os.environ["GEMINI_API_KEY"] == "test":
         del os.environ["GEMINI_API_KEY"]
     assert named_in("Intro\n### 1. J. Barrett & Company\ntext\n### 2. **Keller Williams Beverly**\n### Tips") == [

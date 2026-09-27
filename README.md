@@ -23,6 +23,8 @@ python3 app.py            # http://<server>:8765
 APP_KEY=<16+ random chars, your login key>
 APIFY_TOKEN=...            # Google search + Zillow data
 GEMINI_API_KEY=...         # AI review, visibility, message writing
+AI_PROVIDER=claude         # optional: use the server's logged-in Claude Code (your Claude plan) instead of Gemini
+CLAUDE_MODEL=sonnet        # optional: sonnet / opus / haiku
 SALES_BRAIN_API_KEY=...    # Legacy Sales Coach principles
 SNOV_CLIENT_ID=... / SNOV_CLIENT_SECRET=...   # optional email lookup
 PAGESPEED_API_KEY=...      # optional speed grade
