@@ -413,7 +413,8 @@ class Handler(BaseHTTPRequestHandler):
                                   headers=[("Content-Disposition", f'attachment; filename="{match[1]}"')])
             return self._send(list(csv.DictReader(open(file, encoding="utf-8"))))
         if path == "/api/reports":
-            files = sorted((f for f in os.listdir(REPORTS) if f.endswith(".txt")), reverse=True) \
+            files = sorted((f for f in os.listdir(REPORTS) if f.endswith(".txt")),  # newest first
+                           key=lambda f: os.path.getmtime(os.path.join(REPORTS, f)), reverse=True) \
                 if os.path.isdir(REPORTS) else []
             return self._send(files)
         if match := re.fullmatch(r"/api/reports/([\w.-]+\.txt)", path):
