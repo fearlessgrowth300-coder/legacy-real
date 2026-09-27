@@ -29,3 +29,11 @@ PAGESPEED_API_KEY=...      # optional speed grade
 ```
 
 Prospect data (reports, results, chats, jobs, caches) stays on the server and is git-ignored.
+
+## Deploy (automatic)
+
+- **Frontend** — Vercel (`legacy-real.vercel.app`), redeploys on every push to `main`. `vercel.json` serves `static/`
+  and forwards `/api/*` over https to the backend.
+- **Backend** — VPS behind Caddy (`https://2-25-126-125.sslip.io`, free Let's Encrypt certificate); the app itself
+  listens on `127.0.0.1:8765` only. `deploy/autoupdate.sh` runs every minute (systemd `legacy-real-update.timer`),
+  pulls new commits and restarts the app — skipped while a job is running.
