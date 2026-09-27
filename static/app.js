@@ -178,6 +178,44 @@ async function dashboard() {
   if (!d.recent_jobs.length) recent.append(h('p', {class: 'muted small'}, 'Nothing run yet.'));
   for (const j of d.recent_jobs) recent.append(jobItem(j));
   p.append(h('div', {class: 'grid g2', style: 'margin-top:14px'}, top, recent));
+  const sets = await api('/api/results');
+  if (sets.length) {
+    const rows = await api('/api/results/' + esc(sets[0].file));
+    p.append(h('div', {class: 'card', style: 'margin-top:14px'},
+      h('div', {class: 'card-head'}, h('h2', {}, `Contacts · ${sets[0].label} · ${rows.length}`),
+        h('div', {class: 'row'}, h('a', {class: 'btn secondary sm', href: `/api/results/${esc(sets[0].file)}?download=1`}, icon('download'), 'CSV'),
+          h('a', {href: `#/leads?file=${esc(sets[0].file)}`}, 'All leads'))),
+      contactTable(rows)));
+  }
+}
+const SOCIALS = [['Linkedin', 'LinkedIn'], ['Instagram', 'Instagram'], ['Facebook', 'Facebook'], ['Tiktok', 'TikTok'], ['Youtube', 'YouTube'], ['X', 'X']];
+// big brokerage pages list every agent's email: the ones with this agent's name in them go first
+function rankEmails(r) {
+  const words = (r['Business Name'] || '').toLowerCase().match(/[a-z]{3,}/g) || [];
+  const emails = (r['Emails'] || '').split(';').map(x => x.trim()).filter(isEmail);
+  return emails.map((e, i) => [words.some(w => e.toLowerCase().split('@')[0].includes(w)) ? 0 : 1, i, e]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(x => x[2]);
+}
+function contactTable(rows) {  // spreadsheet view: who, how to reach them, where they are online
+  const a = (href, text) => h('a', {href, target: '_blank', rel: 'noopener noreferrer', onclick: e => e.stopPropagation()}, text);
+  const cell = (...kids) => h('td', {}, ...kids);
+  const body = rows.map(r => {
+    const emails = rankEmails(r), more = emails.length - 2;
+    const phone = r['Main Office Phone'] || '';
+    const socials = SOCIALS.filter(([k]) => safeUrl(r[k]));
+    const site = safeUrl(r['Website URL']);
+    return h('tr', {onclick: () => leadSheet(r)},
+      cell(h('span', {class: 'pill ' + tier(r['Prospect Score'])}, tier(r['Prospect Score']))),
+      cell(h('b', {}, r['Business Name'] || '—'), h('div', {class: 'tiny muted'}, [r['Brokerage'], r['Address']].filter(Boolean).join(' · '))),
+      cell(phone ? h('a', {href: 'tel:' + phone.replace(/[^\d+]/g, ''), onclick: e => e.stopPropagation()}, phone) : '—'),
+      cell(...(emails.length ? emails.slice(0, 2).flatMap((e, i) => [i ? h('br') : null, h('a', {href: 'mailto:' + e, onclick: ev => ev.stopPropagation()}, e)]) : ['—']),
+        more > 0 ? h('div', {class: 'tiny muted'}, `+${more} more (tap row)`) : null),
+      cell(site ? a(site, site.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').slice(0, 40)) : '—'),
+      cell(...(socials.length ? socials.flatMap(([k, label], i) => [i ? ' · ' : '', a(r[k], label)]) : ['—'])),
+      cell(r['Sales (12 mo)'] || '—'));
+  });
+  return h('div', {class: 'table-wrap'}, h('table', {class: 'sheet-table'},
+    h('thead', {}, h('tr', {}, ...['Score', 'Name', 'Phone', 'Email', 'Website', 'Social', 'Sales/yr'].map(t => h('th', {}, t)))),
+    h('tbody', {}, ...body)));
 }
 
 function jobForm(kind, fields, button, note) {
@@ -269,8 +307,9 @@ async function leads(_, params) {
   pick.value = params.get('file') || sets[0].file;
   const dl = h('a', {class: 'btn secondary'}, icon('download'), 'CSV');
   const q = h('input', {type: 'search', placeholder: 'Search name, brokerage, email…', value: params.get('q') || ''});
-  let filter = 'ALL'; const chips = h('div', {class: 'chips'}); const grid = h('div', {class: 'leads'}); let rows = [];
-  p.append(h('div', {class: 'card', style: 'margin-bottom:16px'}, h('div', {class: 'row wrap'}, h('div', {style: 'flex:1;min-width:220px'}, pick), dl),
+  let filter = 'ALL', view = localStorage.getItem('leadsView') || 'cards'; const chips = h('div', {class: 'chips'}); const grid = h('div', {class: 'leads'}); let rows = [];
+  const views = h('div', {class: 'seg', role: 'group'});
+  p.append(h('div', {class: 'card', style: 'margin-bottom:16px'}, h('div', {class: 'row wrap'}, h('div', {style: 'flex:1;min-width:220px'}, pick), views, dl),
     h('div', {class: 'row wrap', style: 'margin-top:12px'}, h('div', {class: 'search', style: 'flex:1;min-width:220px'}, icon('search'), q), chips)), grid);
   const draw = () => {
     const counts = {ALL: rows.length}; rows.forEach(r => counts[tier(r['Prospect Score'])] = (counts[tier(r['Prospect Score'])] || 0) + 1);
@@ -280,8 +319,13 @@ async function leads(_, params) {
     grid.innerHTML = ''; const term = q.value.toLowerCase();
     const shown = rows.map((r, i) => [r, i]).filter(([r]) => (filter === 'ALL' || tier(r['Prospect Score']) === filter) &&
       (!term || Object.values(r).join(' ').toLowerCase().includes(term)));
+    views.innerHTML = '';
+    for (const [id, label] of [['cards', 'Cards'], ['table', 'Table']]) views.append(h('button', {type: 'button', 'aria-pressed': String(view === id),
+      onclick: () => { view = id; try { localStorage.setItem('leadsView', id); } catch {} draw(); }}, label));
+    grid.className = view === 'table' ? '' : 'leads';
     if (!shown.length) grid.append(h('div', {class: 'card'}, empty('search', 'Nothing matches', 'Try another filter or search.')));
-    for (const [r, i] of shown) grid.append(leadCard(r, () => leadSheet(r)));
+    else if (view === 'table') grid.append(h('div', {class: 'card'}, contactTable(shown.map(([r]) => r))));
+    else for (const [r, i] of shown) grid.append(leadCard(r, () => leadSheet(r)));
     if (params.get('q') && shown.length === 1) { leadSheet(shown[0][0]); params.delete('q'); }
   };
   const load = async () => {
@@ -304,7 +348,7 @@ function leadSheet(r) {
   const t = tier(r['Prospect Score']);
   const link = (u, text) => safeUrl(u) ? h('a', {href: u, target: '_blank', rel: 'noopener noreferrer'}, text || u) : (u || '—');
   const kv = pairs => h('dl', {class: 'kv'}, pairs.filter(([, v]) => v && v !== '0').flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, v)]));
-  const phone = r['Main Office Phone']; const emails = (r['Emails'] || '').split(';').map(s => s.trim()).filter(isEmail);
+  const phone = r['Main Office Phone']; const emails = rankEmails(r);
   const socials = ['Instagram', 'Facebook', 'Linkedin', 'Tiktok', 'Youtube', 'X'].filter(k => safeUrl(r[k]));
   const grades = ['Schema', 'Geo Pin', 'Schema Data', 'NAP', 'H1', 'Speed', 'Other Issues'].filter(k => r[k]);
   const body = h('div', {},
