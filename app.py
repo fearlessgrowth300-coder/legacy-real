@@ -6,7 +6,7 @@ Every tool command runs as a background job with its own log and results file, o
 limits + RAM). Keys and prospect data stay on the server: .env, reports/, results/, chats/, jobs/ are never
 committed.
 """
-import csv, hmac, json, os, re, secrets, subprocess, sys, threading, time
+import csv, hashlib, hmac, json, os, re, secrets, subprocess, sys, threading, time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
@@ -16,12 +16,114 @@ import maps_leads as m
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORTS, CHATS, JOBS, RESULTS = (os.path.join(HERE, d) for d in ("reports", "chats", "jobs", "results"))
-m.load_env_file(os.path.join(HERE, ".env"))
-APP_KEY = os.environ.get("APP_KEY") or os.environ.get("CHAT_TOKEN", "")
+ENV_FILE, USERS_FILE = os.path.join(HERE, ".env"), os.path.join(HERE, "data", "users.json")
+m.load_env_file(ENV_FILE)
+APP_KEY = os.environ.get("APP_KEY") or os.environ.get("CHAT_TOKEN", "")  # one-time setup code for the first account
 PORT = int(os.environ.get("APP_PORT", os.environ.get("CHAT_PORT", "8765")))
-SESSIONS = set()  # ponytail: in-memory logins, restart = log in again; move to a file if that gets annoying
+SESSIONS = {}  # sid -> username. ponytail: in-memory, a server restart = sign in again
 RUNNING = {"id": None}
 LOCK = threading.Lock()
+
+# Keys the Settings page may add/replace/remove (nothing else in .env is reachable from the web)
+INTEGRATIONS = [
+    {"id": "gemini", "name": "Google Gemini", "fields": ["GEMINI_API_KEY"],
+     "powers": "AI Review of page sources, AI Visibility checks, message writing, chat coaching",
+     "get": "aistudio.google.com → Get API key"},
+    {"id": "apify", "name": "Apify", "fields": ["APIFY_TOKEN"],
+     "powers": "Google search sweep for people, Zillow agent data (sales, reviews, volume)",
+     "get": "console.apify.com → Settings → API & Integrations"},
+    {"id": "salesbrain", "name": "Sales Brain", "fields": ["SALES_BRAIN_API_KEY"],
+     "powers": "Principles from your books & videos for every message and chat reply",
+     "get": "Legacy Sales Coach → Settings → Sales Brain API key (lsc_live_…)"},
+    {"id": "snov", "name": "Snov.io", "fields": ["SNOV_CLIENT_ID", "SNOV_CLIENT_SECRET"],
+     "powers": "Email lookup when an agent's website shows none",
+     "get": "app.snov.io → Account → API"},
+    {"id": "pagespeed", "name": "Google PageSpeed", "fields": ["PAGESPEED_API_KEY"],
+     "powers": "Mobile speed grade in audits",
+     "get": "console.cloud.google.com → APIs → PageSpeed Insights API → Credentials"},
+]
+EDITABLE = {f for i in INTEGRATIONS for f in i["fields"]}
+
+
+# ---------------------------------------------------------------- accounts & settings
+
+def users():
+    return json.load(open(USERS_FILE, encoding="utf-8")) if os.path.exists(USERS_FILE) else {}
+
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1).hex()
+    return f"{salt}${digest}"
+
+
+def check_password(password, stored):
+    salt, _, digest = stored.partition("$")
+    return hmac.compare_digest(hash_password(password, salt).partition("$")[2], digest)
+
+
+def save_user(name, password):
+    all_users = users()
+    all_users[name] = {"password": hash_password(password), "created": time.strftime("%Y-%m-%d")}
+    os.makedirs(os.path.dirname(USERS_FILE), exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_users, f, indent=1)
+    os.chmod(USERS_FILE, 0o600)
+
+
+def set_env(key, value):
+    """Add/replace (value) or remove (None) one key in .env and in this process; jobs start with the new value."""
+    lines = open(ENV_FILE, encoding="utf-8").read().splitlines() if os.path.exists(ENV_FILE) else []
+    lines = [l for l in lines if not l.startswith(key + "=")]
+    if value:
+        lines.append(f"{key}={value}")
+        os.environ[key] = value
+    else:
+        os.environ.pop(key, None)
+    tmp = ENV_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ENV_FILE)
+    m._gemini_exhausted.clear()
+    m._visibility_cache.pop("_no_brain", None)
+
+
+def mask(value):
+    return ("•" * 6 + value[-4:]) if value and len(value) > 8 else ("•" * 6 if value else "")
+
+
+def test_integration(iid):
+    """A cheap real call per service, so 'connected' means the key actually works."""
+    env = os.environ
+    try:
+        if iid == "gemini":
+            url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=5"
+            urllib.request.urlopen(urllib.request.Request(url, headers={"x-goog-api-key": env["GEMINI_API_KEY"]}),
+                                   timeout=20)
+            return True, "Key accepted by Google"
+        if iid == "apify":
+            usage = apify_usage()
+            return (True, f"Connected · ${usage['used']} of ${usage['limit']} used this month") if usage \
+                else (False, "Apify rejected the token")
+        if iid == "salesbrain":
+            return (True, "Sales Brain answered with principles") if m.sales_brain("cold outreach first message") \
+                else (False, "No principles returned — check the key and that the Sales Brain API is deployed")
+        if iid == "snov":
+            body = m.urlencode({"grant_type": "client_credentials", "client_id": env["SNOV_CLIENT_ID"],
+                                "client_secret": env["SNOV_CLIENT_SECRET"]}).encode()
+            json.load(urllib.request.urlopen("https://api.snov.io/v1/oauth/access_token", body, 20))["access_token"]
+            return True, "Snov.io accepted the keys"
+        if iid == "pagespeed":
+            url = ("https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=https://example.com&strategy=mobile"
+                   f"&category=performance&key={env['PAGESPEED_API_KEY']}")
+            urllib.request.urlopen(url, timeout=90)
+            return True, "PageSpeed answered"
+    except KeyError:
+        return False, "Not connected yet"
+    except Exception as e:
+        return False, f"Failed: {str(e)[:120]}"
+    return False, "Unknown integration"
 
 
 # ---------------------------------------------------------------- jobs: tool commands run in the background
@@ -192,21 +294,62 @@ def apify_usage():
         return None
 
 
+# ---------------------------------------------------------------- dashboard data
+
+def result_sets():
+    """Result files with a readable label from their job."""
+    out = []
+    for f in sorted((f for f in os.listdir(RESULTS) if f.endswith(".csv")), reverse=True) if os.path.isdir(RESULTS) else []:
+        meta = job_meta(f[:-4]) or {}
+        params = meta.get("params", {})
+        what = {"hunt": f"Hunt · top {params.get('top', '?')} hot areas", "zips": f"ZIPs {params.get('zips', '')}",
+                "zillow": f"Zillow · {params.get('city', '')}"}.get(meta.get("type"), meta.get("type") or "Imported")
+        rows = sum(1 for _ in csv.DictReader(open(os.path.join(RESULTS, f), encoding="utf-8")))  # pitches span lines
+        out.append({"file": f, "label": what, "date": meta.get("started", ""), "rows": max(rows, 0)})
+    return out
+
+
+def dashboard():
+    sets = result_sets()
+    scores, excellent = {"EXCELLENT": 0, "OKAY": 0, "POOR": 0}, []
+    for s in sets[:10]:
+        for r in csv.DictReader(open(os.path.join(RESULTS, s["file"]), encoding="utf-8")):
+            tier = (r.get("Prospect Score") or "").split(":")[0]
+            if tier in scores:
+                scores[tier] += 1
+            if tier == "EXCELLENT" and len(excellent) < 6:
+                excellent.append({"name": r.get("Business Name", ""), "why": r["Prospect Score"].split(":", 1)[1].strip(),
+                                  "file": s["file"]})
+    everyone = people()
+    chats_active = sum(1 for s in everyone if load_chat(s)["turns"])
+    return {"leads": sum(s["rows"] for s in sets), "scores": scores, "excellent": excellent,
+            "people": len(everyone), "chats": chats_active, "running": RUNNING["id"],
+            "connected": {i["id"]: all(os.environ.get(f) for f in i["fields"]) for i in INTEGRATIONS},
+            "recent_jobs": [job_meta(f[:-5]) for f in sorted(os.listdir(JOBS), reverse=True)
+                            if f.endswith(".json")][:5] if os.path.isdir(JOBS) else []}
+
+
 # ---------------------------------------------------------------- HTTP
 
+STATIC = {"/": ("index.html", "text/html"), "/app.css": ("app.css", "text/css"),
+          "/app.js": ("app.js", "text/javascript"), "/manifest.json": ("manifest.json", "application/manifest+json"),
+          "/icon.svg": ("icon.svg", "image/svg+xml")}
+USERNAME = re.compile(r"^[A-Za-z0-9_.@-]{3,40}$")
+
+
 class Handler(BaseHTTPRequestHandler):
-    def _session(self):
+    def _user(self):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
-        sid = cookie["lr_session"].value if "lr_session" in cookie else ""
-        return sid if sid in SESSIONS else None
+        return SESSIONS.get(cookie["lr_session"].value) if "lr_session" in cookie else None
 
     def _send(self, body, status=200, kind="application/json", headers=()):
         data = body if isinstance(body, bytes) else (body.encode() if isinstance(body, str) else json.dumps(body).encode())
         self.send_response(status)
-        self.send_header("Content-Type", kind + ("; charset=utf-8" if "json" in kind or "text" in kind else ""))
+        self.send_header("Content-Type", kind + ("; charset=utf-8" if kind.startswith(("text", "application/json")) else ""))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Robots-Tag", "noindex")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         for k, v in headers:
             self.send_header(k, v)
@@ -217,20 +360,28 @@ class Handler(BaseHTTPRequestHandler):
         length = min(int(self.headers.get("Content-Length", 0)), 50000)
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def _sign_in(self, name):
+        sid = secrets.token_urlsafe(32)
+        SESSIONS[sid] = name
+        return self._send({"ok": True, "user": name}, headers=[(
+            "Set-Cookie", f"lr_session={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000")])
+
     def do_GET(self):
         path = unquote(urlparse(self.path).path)
-        if path in ("/", "/index.html"):
-            return self._send(open(os.path.join(HERE, "static", "index.html"), "rb").read(), kind="text/html")
-        if path == "/manifest.json":
-            return self._send(open(os.path.join(HERE, "static", "manifest.json"), "rb").read(),
-                              kind="application/manifest+json")
-        if not self._session():
-            return self._send({"error": "login required"}, 401)
+        if path in STATIC:
+            file, kind = STATIC[path]
+            return self._send(open(os.path.join(HERE, "static", file), "rb").read(), kind=kind)
+        if path == "/api/me":
+            return self._send({"user": self._user(), "needs_setup": not users()})
+        if not self._user():
+            return self._send({"error": "sign in required"}, 401)
+        if path == "/api/dashboard":
+            return self._send(dashboard())
+        if path == "/api/settings":
+            return self._send([{**i, "values": {f: mask(os.environ.get(f, "")) for f in i["fields"]},
+                                "connected": all(os.environ.get(f) for f in i["fields"])} for i in INTEGRATIONS])
         if path == "/api/status":
-            return self._send({"running": RUNNING["id"], "apify": apify_usage(),
-                               "keys": {k: bool(os.environ.get(k)) for k in
-                                        ("APIFY_TOKEN", "GEMINI_API_KEY", "SALES_BRAIN_API_KEY", "SNOV_CLIENT_ID",
-                                         "PAGESPEED_API_KEY")}})
+            return self._send({"running": RUNNING["id"], "apify": apify_usage()})
         if path == "/api/hot-zips":
             return self._send([{"zip": z, "city": c, "state": s, "price": p} for z, c, s, p in m.HOT_ZIPS_2026])
         if path == "/api/jobs":
@@ -245,9 +396,7 @@ class Handler(BaseHTTPRequestHandler):
             log = open(log_path, encoding="utf-8", errors="ignore").read()[-20000:] if os.path.exists(log_path) else ""
             return self._send({**meta, "log": log})
         if path == "/api/results":
-            files = sorted((f for f in os.listdir(RESULTS) if f.endswith(".csv")), reverse=True) \
-                if os.path.isdir(RESULTS) else []
-            return self._send(files)
+            return self._send(result_sets())
         if match := re.fullmatch(r"/api/results/([\w.-]+\.csv)", path):
             file = os.path.join(RESULTS, match[1])
             if not os.path.exists(file):
@@ -265,7 +414,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(open(file, encoding="utf-8").read(), kind="text/plain") if os.path.exists(file) \
                 else self._send({"error": "not found"}, 404)
         if path == "/api/people":
-            return self._send([{"slug": s, "name": n, "turns": len(load_chat(s)["turns"])}
+            return self._send([{"slug": s, "name": n, "turns": len(load_chat(s)["turns"]),
+                                "last": (load_chat(s)["turns"] or [{}])[-1].get("at", "")}
                                for s, (n, _) in people().items()])
         if (match := re.fullmatch(r"/api/chat/([\w-]+)", path)) and match[1] in people():
             name, report_path = people()[match[1]]
@@ -276,19 +426,61 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/setup":  # first account only; needs the setup code from the server's .env
+            if users():
+                return self._send({"error": "already set up"}, 400)
+            b = self._body()
+            if not (APP_KEY and hmac.compare_digest(str(b.get("code", "")), APP_KEY)):
+                time.sleep(1)
+                return self._send({"error": "wrong setup code"}, 403)
+            name, pw = str(b.get("username", "")).strip(), str(b.get("password", ""))
+            if not USERNAME.match(name) or len(pw) < 10:
+                return self._send({"error": "username 3-40 characters; password at least 10 characters"}, 400)
+            save_user(name, pw)
+            return self._sign_in(name)
         if path == "/api/login":
-            given = str(self._body().get("key", ""))
-            if not (APP_KEY and hmac.compare_digest(given, APP_KEY)):
+            b = self._body()
+            name, record = str(b.get("username", "")).strip(), users().get(str(b.get("username", "")).strip())
+            if not (record and check_password(str(b.get("password", "")), record["password"])):
                 time.sleep(1)  # slow down guessing
-                return self._send({"error": "wrong key"}, 403)
-            sid = secrets.token_urlsafe(32)
-            SESSIONS.add(sid)
-            return self._send({"ok": True}, headers=[(
-                "Set-Cookie", f"lr_session={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000")])
-        if not self._session():
-            return self._send({"error": "login required"}, 401)
+                return self._send({"error": "wrong username or password"}, 403)
+            return self._sign_in(name)
+        user = self._user()
+        if not user:
+            return self._send({"error": "sign in required"}, 401)
         if path == "/api/logout":
-            SESSIONS.discard(self._session())
+            for sid, name in list(SESSIONS.items()):
+                if name == user:
+                    SESSIONS.pop(sid)
+            return self._send({"ok": True})
+        if path == "/api/password":
+            b = self._body()
+            if not check_password(str(b.get("current", "")), users()[user]["password"]):
+                time.sleep(1)
+                return self._send({"error": "current password is wrong"}, 403)
+            if len(str(b.get("new", ""))) < 10:
+                return self._send({"error": "new password must be at least 10 characters"}, 400)
+            save_user(user, str(b["new"]))
+            return self._send({"ok": True})
+        if match := re.fullmatch(r"/api/settings/(\w+)(/test|/remove)?", path):
+            integ = next((i for i in INTEGRATIONS if i["id"] == match[1]), None)
+            if not integ:
+                return self._send({"error": "unknown integration"}, 404)
+            if match[2] == "/test":
+                ok, msg = test_integration(integ["id"])
+                return self._send({"ok": ok, "message": msg})
+            if match[2] == "/remove":
+                for f in integ["fields"]:
+                    set_env(f, None)
+                return self._send({"ok": True})
+            values = self._body()
+            for f in integ["fields"]:
+                v = str(values.get(f, "")).strip()
+                if v and (not re.fullmatch(r"[A-Za-z0-9_.\-:/+=]{8,300}", v)):
+                    return self._send({"error": f"{f} doesn't look like a valid key"}, 400)
+            for f in integ["fields"]:
+                if str(values.get(f, "")).strip():
+                    set_env(f, str(values[f]).strip())
             return self._send({"ok": True})
         if match := re.fullmatch(r"/api/jobs/(hunt|zips|person|audit|zillow)", path):
             try:
@@ -315,8 +507,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if len(APP_KEY) < 16:
-        sys.exit("Set APP_KEY (16+ random characters) in .env first")
+    if not users() and len(APP_KEY) < 16:
+        sys.exit("Set APP_KEY (16+ random characters) in .env -- it's the one-time setup code for your account")
     mark_interrupted()
     print(f"Legacy Real on port {PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

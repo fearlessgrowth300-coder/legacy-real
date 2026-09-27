@@ -1,5 +1,7 @@
 # secrets
 .env
+.env.tmp
+data/
 # prospect data -- stays on the server, never in git
 reports/
 results/
