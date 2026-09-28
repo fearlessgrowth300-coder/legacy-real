@@ -487,6 +487,24 @@ def chat_from_screens(paths, platform, name, notes, email):
         facts.append(f"Who they are: {profile['who_they_are']}")
     if notes:
         facts.append(f"My notes: {notes}")
+    slug = re.sub(r"\W+", "-", name).strip("-") or "Unknown"
+    with LOCK:  # the chat remembers where you met them + their email, whichever path writes the report
+        chat = load_chat(slug)
+        chat.update(platform=platform, **({"email": email} if email else {}))
+        save_chat(slug, chat)
+    if city and re.fullmatch(r"[^,]+,\s*[A-Za-z]{2}", city):
+        # full research, same as the Research page: Maps, web sweep, Zillow, every website + page source audit,
+        # AI review/visibility, Sales Brain -> first messages. The report it writes becomes this chat.
+        one_line = lambda v: " ".join(str(v or "").split())[:390].lstrip("-")
+        about = "; ".join([str(profile.get("headline") or "")] + [as_text(f) for f in profile.get("facts") or []])
+        try:
+            job = start_job("person", {"name": name, "city": city, "brokerage": one_line(profile.get("business")),
+                                       "sites": " ".join(re.findall(r"(?:https?://)?[\w-]+(?:\.[\w-]+)+(?:/[^\s()]*)?",
+                                                                   str(profile.get("website") or "")))[:390], "phone": one_line(profile.get("phone")),
+                                       "address": one_line(profile.get("address")), "notes": one_line(about)})
+            return {"slug": slug, "job": job["id"]}
+        except (ValueError, RuntimeError):
+            pass  # another job is running / odd field: fall back to the quick opener from the screenshots alone
     out = m.outreach(name, facts, f"{platform} DM")
     used = "\n".join(f"- {u.get('principle', '')}: {u.get('how', '')}" for u in out["principles_used"])
     report = (f"{name} | {city} | {time.ctime()}\n\nFACTS (read from their {platform} screenshots):\n"
@@ -495,13 +513,8 @@ def chat_from_screens(paths, platform, name, notes, email):
               + f"\n\nMESSAGES:\nMESSAGE 1\n{out.get('message', '')}\n\nMESSAGE 2 (after they reply)\n"
               f"{out.get('followup', '')}\n\nPRINCIPLES USED:\n{used}\n")
     os.makedirs(REPORTS, exist_ok=True)
-    slug = re.sub(r"\W+", "-", name).strip("-") or "Unknown"
     with open(os.path.join(REPORTS, f"{slug}-{time.strftime('%Y-%m-%d-%H%M')}.txt"), "w", encoding="utf-8") as f:
         f.write(report)
-    with LOCK:
-        chat = load_chat(slug)
-        chat.update(platform=platform, **({"email": email} if email else {}))
-        save_chat(slug, chat)
     return {"slug": slug}
 
 

@@ -472,8 +472,18 @@ function newChat() {
       status.replaceChildren(h('span', {class: 'spin'}), ' Uploading…');
       const images = await Promise.all(files.map(shrink));
       const {task} = await api('/api/chat/new', {...formData(form), images});
-      status.replaceChildren(h('span', {class: 'spin'}), ' Reading their page, asking your Sales Brain, writing your opener… (1–3 min)');
-      const t = await waitTask(task); close(); toast('Chat ready'); go('#/chat/' + t.slug);
+      status.replaceChildren(h('span', {class: 'spin'}), ' Reading their page… (about 1 min)');
+      const t = await waitTask(task);
+      if (t.job) {  // full research is running: website + page source audit, Maps, Zillow, AI, Sales Brain
+        const step = h('span'); status.replaceChildren(h('span', {class: 'spin'}), ' Full research running (3–6 min): ', step,
+          h('div', {class: 'tiny muted', style: 'margin-top:4px'}, 'You can close this — the chat appears when it finishes (Activity shows the live log).'));
+        for (;;) {
+          await sleep(4000); const j = await api('/api/jobs/' + t.job);
+          step.textContent = ((j.log || '').trim().split('\n').filter(l => /^\d\./.test(l)).pop() || 'starting…');
+          if (j.status !== 'running') { if (j.status !== 'done') throw new Error('Research ' + j.status + ' — see Activity'); break; }
+        }
+      }
+      close(); toast('Chat ready'); go('#/chat/' + t.slug);
     } catch (err) { status.textContent = ''; toast(err.message, true); btn.disabled = false; }
   }},
     h('div', {class: 'drop', onclick: () => pickFiles.click(), ondragover: e => e.preventDefault(), ondrop: e => { e.preventDefault(); add([...e.dataTransfer.files]); }},
@@ -481,10 +491,10 @@ function newChat() {
     thumbs,
     h('div', {class: 'grid g2'}, field('Where', platform), field('Name', input('name', {placeholder: 'We read it from the page'})),
       field('Their email', input('email', {type: 'email', placeholder: 'Optional — if you have it'})), field('Your notes', input('notes', {placeholder: 'Optional'}))),
-    h('div', {class: 'form-actions'}, h('button', {class: 'btn', type: 'submit'}, icon('zap'), 'Analyze & write opener')), status);
+    h('div', {class: 'form-actions'}, h('button', {class: 'btn', type: 'submit'}, icon('zap'), 'Analyze & research')), status);
   const onPaste = e => add([...(e.clipboardData?.files || [])]);
   document.addEventListener('paste', onPaste);
-  const close0 = sheet('New chat from screenshots', 'The AI reads their page, your Sales Brain picks the principles, then it writes your first message.', form);
+  const close0 = sheet('New chat from screenshots', 'Reads their page → audits their website + page source → Maps, Zillow, web → your Sales Brain → first message.', form);
   const close = () => { document.removeEventListener('paste', onPaste); close0(); };
   new MutationObserver((_, obs) => { if (!document.body.contains(form)) { document.removeEventListener('paste', onPaste); obs.disconnect(); } }).observe(document.body, {childList: true});
 }
