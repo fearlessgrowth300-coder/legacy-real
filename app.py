@@ -6,7 +6,7 @@ Every tool command runs as a background job with its own log and results file, o
 limits + RAM). Keys and prospect data stay on the server: .env, reports/, results/, chats/, jobs/ are never
 committed.
 """
-import base64, csv, hashlib, hmac, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time
+import base64, csv, hashlib, html, hmac, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode, urlparse, parse_qs, unquote
@@ -99,38 +99,102 @@ def email_ready():
     return bool(os.environ.get("GMAIL_REFRESH_TOKEN") or connected(next(i for i in INTEGRATIONS if i["id"] == "email")))
 
 
-def send_email(to, subject, body):
-    """Gmail (signed in with Google) when connected, otherwise the app-password mailbox."""
+def send_email(to, subject, body, track=""):
+    """Gmail (signed in with Google) when connected, otherwise the app-password mailbox. track = id of an invisible
+    1px image (opens). Returns the Gmail threadId (to spot replies/bounces later) or ""."""
     gmail = os.environ.get("GMAIL_REFRESH_TOKEN")
     msg = EmailMessage()
     msg["From"] = formataddr((os.environ.get("SMTP_FROM_NAME", ""),
                               os.environ["GMAIL_ADDRESS"] if gmail else os.environ["SMTP_USER"]))
     msg["To"], msg["Subject"] = to, subject
     msg.set_content(body)
+    if track:  # plain text for spam filters + the same text as HTML carrying the open pixel
+        msg.add_alternative(
+            '<div style="font-family:Arial,sans-serif;font-size:14px">' + html.escape(body).replace("\n", "<br>")
+            + f'</div><img src="{APP_URL}/api/t/{track}.gif" width="1" height="1" alt="" style="display:block">',
+            subtype="html")
     if gmail:
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         try:
-            urllib.request.urlopen(urllib.request.Request(
+            return json.load(urllib.request.urlopen(urllib.request.Request(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", json.dumps({"raw": raw}).encode(),
-                {"Authorization": f"Bearer {gmail_access_token()}", "Content-Type": "application/json"}), timeout=30)
+                {"Authorization": f"Bearer {gmail_access_token()}", "Content-Type": "application/json"}),
+                timeout=30)).get("threadId", "")
         except urllib.error.HTTPError as e:  # surface Google's reason (API disabled, quota...) instead of "403"
             reason = json.loads(e.read() or b"{}").get("error", {}).get("message", "")
             raise RuntimeError(f"Gmail said: {reason.split(' Enable it')[0] or e}") from None
-        return
     with smtp_open() as server:
         server.send_message(msg)
+    return ""
 
 
 def sent_log():
     return json.load(open(SENT_FILE, encoding="utf-8")) if os.path.exists(SENT_FILE) else []
 
 
+def save_sent(log):
+    os.makedirs(os.path.dirname(SENT_FILE), exist_ok=True)
+    with open(SENT_FILE, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=1)
+
+
 def log_sent(entry):
     with LOCK:
-        log = sent_log() + [entry]
-        os.makedirs(os.path.dirname(SENT_FILE), exist_ok=True)
-        with open(SENT_FILE, "w", encoding="utf-8") as f:
-            json.dump(log, f, indent=1)
+        save_sent(sent_log() + [entry])
+
+
+def log_open(track, agent):
+    with LOCK:
+        log = sent_log()
+        for e in log:
+            if e.get("id") == track:
+                e.setdefault("opens", []).append({"at": time.strftime("%Y-%m-%d %H:%M"), "via": agent[:80]})
+                save_sent(log)
+                return
+
+
+CHECKING = {"last": 0}
+
+
+def check_replies():
+    """For Gmail threads we started: did they reply? did it bounce? (reads only the From/Date headers)"""
+    if not os.environ.get("GMAIL_REFRESH_TOKEN") or time.time() - CHECKING["last"] < 300:
+        return
+    CHECKING["last"] = time.time()
+    try:
+        token, me = gmail_access_token(), os.environ.get("GMAIL_ADDRESS", "").lower()
+    except Exception:
+        return
+    updates = {}
+    for e in sent_log():
+        if not e.get("thread") or e.get("replied") or e.get("bounced") or \
+                time.time() - time.mktime(time.strptime(e["at"], "%Y-%m-%d %H:%M")) > 45 * 86400:
+            continue
+        try:
+            thread = json.load(urllib.request.urlopen(urllib.request.Request(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{e['thread']}?format=metadata"
+                "&metadataHeaders=From", headers={"Authorization": f"Bearer {token}"}), timeout=20))
+        except urllib.error.HTTPError as err:
+            if err.code == 403:  # connected before tracking existed: token lacks the read-headers permission
+                CHECKING["reconnect"] = True
+                return
+            continue
+        except Exception:
+            continue
+        CHECKING["reconnect"] = False
+        for msg in thread.get("messages", []):
+            sender = next((h["value"] for h in msg.get("payload", {}).get("headers", []) if h["name"] == "From"), "")
+            at = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(msg.get("internalDate", 0)) / 1000))
+            if re.search(r"mailer-daemon|postmaster", sender, re.I):
+                updates[e["id"]] = {"bounced": at}
+            elif me not in sender.lower():
+                updates[e["id"]] = {"replied": at}
+    if updates:
+        with LOCK:
+            log = sent_log()
+            for e in log:
+                e.update(updates.get(e.get("id"), {}))
+            save_sent(log)
 
 
 def run_task(fn, *args):
@@ -589,6 +653,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(open(os.path.join(HERE, "static", file), "rb").read(), kind=kind)
         if path == "/api/me":
             return self._send({"user": self._user(), "needs_setup": not users()})
+        if match := re.fullmatch(r"/api/t/([\w-]{8,40})\.gif", path):
+            log_open(match[1], self.headers.get("User-Agent", ""))
+            return self._send(base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"), kind="image/gif")
         if path == "/api/gmail/callback":
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             born = OAUTH_STATES.pop(q.get("state", ""), 0)
@@ -628,13 +695,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
                 "client_id": os.environ["GOOGLE_CLIENT_ID"], "redirect_uri": f"{APP_URL}/api/gmail/callback",
                 "response_type": "code", "access_type": "offline", "prompt": "consent", "state": state,
-                "scope": "openid email profile https://www.googleapis.com/auth/gmail.send"})})
+                "scope": "openid email profile https://www.googleapis.com/auth/gmail.send "
+                         "https://www.googleapis.com/auth/gmail.metadata"})})
         if match := re.fullmatch(r"/api/screens/([\w-]+)/(\d+\.(?:jpg|png))", path):
             file = os.path.join(HERE, "data", "screens", match[1], match[2])
             return self._send(open(file, "rb").read(), kind="image/" + ("png" if file.endswith("png") else "jpeg")) \
                 if os.path.exists(file) else self._send({"error": "not found"}, 404)
         if path == "/api/sent":
-            return self._send(sent_log()[-500:])
+            threading.Thread(target=check_replies, daemon=True).start()  # results show on the next refresh
+            return self._send({"sent": sent_log()[-500:], "reconnect": CHECKING.get("reconnect", False),
+                               "gmail": bool(os.environ.get("GMAIL_REFRESH_TOKEN"))})
         if path == "/api/status":
             return self._send({"running": RUNNING["id"], "apify": apify_usage()})
         if path == "/api/hot-zips":
@@ -782,12 +852,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"error": "check the To address, subject and message"}, 400)
             if not email_ready():
                 return self._send({"error": "connect Gmail (or another email) in Settings first"}, 400)
+            track = secrets.token_urlsafe(12)
             try:
-                send_email(to, subject, text)
+                thread = send_email(to, subject, text, track)
             except Exception as e:
                 return self._send({"error": f"your mail server refused it: {str(e)[:160]}"}, 502)
             slug = str(b.get("slug") or "")
-            log_sent({"to": to, "subject": subject, "at": time.strftime("%Y-%m-%d %H:%M"), "slug": slug,
+            log_sent({"id": track, "thread": thread, "opens": [], "to": to, "subject": subject,
+                      "at": time.strftime("%Y-%m-%d %H:%M"), "slug": slug,
                       "lead": str(b.get("lead") or "")[:200]})
             if slug in people():
                 with LOCK:

@@ -97,7 +97,7 @@ const state = {me: null, running: null};
 const NAV = [
   ['dashboard', 'Dashboard', 'home'], ['find', 'Find leads', 'search'], ['leads', 'Leads', 'users'],
   ['research', 'Research', 'research'], ['chat', 'Prospect chat', 'chat'], ['audit', 'Website audit', 'audit'],
-  ['activity', 'Activity', 'activity'], ['reports', 'Reports', 'reports'], ['settings', 'Settings', 'settings'],
+  ['sent', 'Email tracking', 'mail'], ['activity', 'Activity', 'activity'], ['reports', 'Reports', 'reports'], ['settings', 'Settings', 'settings'],
 ];
 const BOTTOM = [['dashboard', 'Home', 'home'], ['leads', 'Leads', 'users'], ['research', 'Research', 'research'], ['chat', 'Chat', 'chat'], ['more', 'More', 'more']];
 let content, jobChip, jobChipTop;
@@ -134,7 +134,7 @@ function updateJobChip() {
 }
 
 // ---------------------------------------------------------------------------------------------- router
-const ROUTES = {dashboard, find, leads, research, chat, audit, activity, reports, settings, more};
+const ROUTES = {dashboard, find, leads, research, chat, audit, sent, activity, reports, settings, more};
 function route() {
   if (!state.me) return;
   const [, name = 'dashboard', ...rest] = location.hash.split('/');
@@ -635,6 +635,35 @@ function aiEngine(ai) {
       h('p', {class: 'tiny muted'}, ai.claude_installed ? 'Runs through Claude Code logged in on your server with your Claude plan — no API key. Uses your plan’s usage limits; a big hunt makes many calls.' : 'Claude Code is not installed on the server.'))
       : h('p', {class: 'tiny muted', style: 'margin-top:12px'}, ai.gemini_connected ? 'Uses your Gemini key below.' : 'Connect a Gemini key below first.'),
     h('div', {class: 'form-actions', style: 'margin-top:12px'}, test), result);
+}
+
+function emailStatus(e) {
+  const days = (Date.now() - new Date(e.at.replace(' ', 'T'))) / 864e5;
+  if (e.bounced) return ['failed', 'Bounced', 'The address doesn’t exist or refused mail — find another email'];
+  if (e.replied) return ['done', 'Replied', `Replied ${e.replied}`];
+  if ((e.opens || []).length) return ['OKAY', `Opened ×${e.opens.length}`, `Last opened ${e.opens.at(-1).at}` + (days > 3 ? ' · no reply after 3 days — send a follow-up' : '')];
+  return ['off', 'Not opened yet', days > 4 ? 'Not opened in 4+ days — may be in spam or ignored; try another channel (LinkedIn/Instagram)' : 'Waiting…'];
+}
+async function sent() {
+  const p = page('Email tracking', 'Who opened your emails, who replied, and what bounced. Refreshes every minute.');
+  const d = await api('/api/sent'); const list = [...d.sent].reverse();
+  if (d.reconnect) p.append(h('a', {class: 'banner', href: '#/settings'}, icon('mail'), 'Reconnect Gmail in Settings once to turn on reply & bounce tracking.'));
+  const n = list.length, opened = list.filter(e => (e.opens || []).length || e.replied).length, replied = list.filter(e => e.replied).length;
+  const stat = (label, value, hint) => h('div', {class: 'card stat'}, h('div', {class: 'label'}, label), h('div', {class: 'value'}, value), hint ? h('div', {class: 'hint'}, hint) : null);
+  const pct = x => n ? Math.round(x / n * 100) + '%' : '—';
+  p.append(h('div', {class: 'grid g3'}, stat('Sent', n), stat('Opened', opened, pct(opened)), stat('Replied', replied, pct(replied))));
+  const card = h('div', {class: 'card', style: 'margin-top:14px'});
+  if (!n) card.append(empty('mail', 'No emails yet', 'Send one from a lead (Write email) or a chat (Send by email).'));
+  for (const e of list) {
+    const [cls, label, hint] = emailStatus(e);
+    card.append(h('div', {class: 'item', style: 'cursor:' + (e.slug ? 'pointer' : 'default'), onclick: () => e.slug && go('#/chat/' + e.slug)},
+      h('div', {class: 'icon-box'}, icon('mail')),
+      h('div', {class: 'grow'}, h('div', {class: 'title'}, `${e.lead || e.to} — ${e.subject}`), h('div', {class: 'sub'}, `${e.to} · sent ${e.at}`), h('div', {class: 'tiny muted'}, hint)),
+      h('span', {class: 'pill ' + cls}, label)));
+  }
+  p.append(card, h('p', {class: 'tiny muted', style: 'margin-top:10px'},
+    'Opens use an invisible image: Apple Mail can count an open that didn’t happen, and people who block images won’t show as opened. Opening your own copy in Gmail’s Sent folder can also count. Replies and bounces are exact.'));
+  clearTimeout(chatTimer); chatTimer = setTimeout(() => { if (location.hash.startsWith('#/sent')) route(); }, 60000);
 }
 
 async function more() {
