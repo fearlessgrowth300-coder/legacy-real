@@ -143,14 +143,65 @@ def log_sent(entry):
         save_sent(sent_log() + [entry])
 
 
-def log_open(track, agent):
+def open_device(agent):
+    """(device, proxy) from the image request's User-Agent. Gmail/Apple/Yahoo fetch images through their own
+    servers, so for those readers the device and place are hidden -- proxy says whose server it was."""
+    if "GoogleImageProxy" in agent:
+        return "Gmail (Google hides the device)", "Google"
+    if "YahooMailProxy" in agent:
+        return "Yahoo Mail (Yahoo hides the device)", "Yahoo"
+    if agent.strip() in ("Mozilla/5.0", ""):  # Apple Mail Privacy Protection: may load it before a human opens it
+        return "Apple Mail privacy (may be automatic, not a real open)", "Apple"
+    os_name = next((label for key, label in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"),
+                                              ("Windows", "Windows PC"), ("Macintosh", "Mac"), ("Linux", "Linux"))
+                    if key in agent), "unknown device")
+    app_name = next((label for key, label in (("Outlook", "Outlook"), ("Thunderbird", "Thunderbird"),
+                                               ("Edg/", "Edge"), ("Chrome/", "Chrome"), ("Safari/", "Safari"),
+                                               ("Firefox/", "Firefox")) if key in agent), "")
+    return (f"{os_name} · {app_name}" if app_name else os_name), ""
+
+
+def ip_place(ip):
+    """City, region, country for a public IP (ipwho.is, free, no key)."""
+    try:
+        d = json.load(urllib.request.urlopen(f"https://ipwho.is/{ip}?fields=success,city,region,country", timeout=8))
+        return ", ".join(x for x in (d.get("city"), d.get("region"), d.get("country")) if x) if d.get("success") else ""
+    except Exception:
+        return ""
+
+
+def log_open(track, headers):
+    agent = headers.get("User-Agent", "")
+    device, proxy = open_device(agent)
+    # real visitor IP: Vercel forwards it (Caddy overwrites X-Forwarded-For with Vercel's own address)
+    ip = (headers.get("X-Vercel-Forwarded-For") or headers.get("X-Real-Ip") or headers.get("X-Forwarded-For")
+          or "").split(",")[0].strip()
+    place = "" if proxy else ", ".join(unquote(x) for x in (headers.get("X-Vercel-Ip-City"),
+                                                           headers.get("X-Vercel-Ip-Country-Region"),
+                                                           headers.get("X-Vercel-Ip-Country")) if x)
+    entry = {"at": time.strftime("%Y-%m-%d %H:%M"), "device": device, "via": agent[:160], "ip": ip,
+             "place": place or (f"{proxy}'s servers" if proxy else "")}
     with LOCK:
         log = sent_log()
         for e in log:
             if e.get("id") == track:
-                e.setdefault("opens", []).append({"at": time.strftime("%Y-%m-%d %H:%M"), "via": agent[:80]})
+                e.setdefault("opens", []).append(entry)
                 save_sent(log)
-                return
+                break
+        else:
+            return
+    if not entry["place"] and ip:  # look the IP up after answering the image request
+
+        def locate():
+            where = ip_place(ip)
+            with LOCK:
+                log = sent_log()
+                for e in log:
+                    for o in e.get("opens", []) if e.get("id") == track else []:
+                        if o.get("ip") == ip and not o.get("place"):
+                            o["place"] = where
+                save_sent(log)
+        threading.Thread(target=locate, daemon=True).start()
 
 
 CHECKING = {"last": 0}
@@ -667,7 +718,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/me":
             return self._send({"user": self._user(), "needs_setup": not users()})
         if match := re.fullmatch(r"/api/t/([\w-]{8,40})\.gif", path):
-            log_open(match[1], self.headers.get("User-Agent", ""))
+            log_open(match[1], self.headers)
             return self._send(base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"), kind="image/gif")
         if path == "/api/gmail/callback":
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
