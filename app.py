@@ -109,9 +109,13 @@ def send_email(to, subject, body):
     msg.set_content(body)
     if gmail:
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        urllib.request.urlopen(urllib.request.Request(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", json.dumps({"raw": raw}).encode(),
-            {"Authorization": f"Bearer {gmail_access_token()}", "Content-Type": "application/json"}), timeout=30)
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", json.dumps({"raw": raw}).encode(),
+                {"Authorization": f"Bearer {gmail_access_token()}", "Content-Type": "application/json"}), timeout=30)
+        except urllib.error.HTTPError as e:  # surface Google's reason (API disabled, quota...) instead of "403"
+            reason = json.loads(e.read() or b"{}").get("error", {}).get("message", "")
+            raise RuntimeError(f"Gmail said: {reason.split(' Enable it')[0] or e}") from None
         return
     with smtp_open() as server:
         server.send_message(msg)
