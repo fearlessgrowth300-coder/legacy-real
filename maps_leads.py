@@ -1058,7 +1058,7 @@ def zillow_by_profile(name, city):
     """One agent straight from their Zillow profile (found via Google) -- for brokerages too big to pull
     (Compass NYC = 885 agents). ~$0.0045 search + ~$0.003 profile, both cached for a week."""
     words = name_words(name) or set(name.lower().split())
-    url = next((r["url"] for r in google_search([f'"{name}" zillow'])
+    url = next((r["url"] for r in google_search([f'site:zillow.com/profile "{name}"'])
                 if re.match(r"https://www\.zillow\.com/profile/", r.get("url", ""))
                 and all(w in r.get("title", "").lower() for w in words)), None)
     if not url:
