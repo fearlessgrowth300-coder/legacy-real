@@ -201,3 +201,8 @@ pre.log { background: var(--surface-2); border-radius: var(--radius-sm); padding
 
 .update-bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: 84px; z-index: 60; border: 0; border-radius: 99px; padding: 12px 20px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; box-shadow: var(--shadow); cursor: pointer; }
 .bubble .thumb { width: 120px; height: 120px; display: block; }
+
+/* phone: nothing may push the page wider than the screen (grid/flex children default to min-width:auto) */
+html, body { overflow-x: hidden; max-width: 100%; }
+.grid > *, .chat > *, .thread, .card, .content, main { min-width: 0; }
+.bubble, .coach, .title, .sub, .quote, .log, .why { overflow-wrap: anywhere; }
