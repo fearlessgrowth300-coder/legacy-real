@@ -1054,6 +1054,40 @@ def zillow_agents(city, min_reviews=10, min_sales=0, limit=50, teams_only=False,
     return kept
 
 
+def zillow_by_profile(name, city):
+    """One agent straight from their Zillow profile (found via Google) -- for brokerages too big to pull
+    (Compass NYC = 885 agents). ~$0.0045 search + ~$0.003 profile, both cached for a week."""
+    words = name_words(name) or set(name.lower().split())
+    url = next((r["url"] for r in google_search([f'"{name}" zillow'])
+                if re.match(r"https://www\.zillow\.com/profile/", r.get("url", ""))
+                and all(w in r.get("title", "").lower() for w in words)), None)
+    if not url:
+        return {}
+    import hashlib
+    cache = os.path.join("zillow-cache", hashlib.sha1(url.encode()).hexdigest() + ".json")
+    if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 7 * 86400:
+        items = json.load(open(cache, encoding="utf-8"))
+    else:
+        try:
+            items = json.load(urllib.request.urlopen(urllib.request.Request(
+                "https://api.apify.com/v2/acts/memo23~zillow-agents-leads-scraper-ppe/run-sync-get-dataset-items?"
+                + urlencode({"token": os.environ["APIFY_TOKEN"], "timeout": 270}),
+                json.dumps({"startUrls": [url], "maxItems": 1, "getPastSales": True}).encode(),  # plain strings
+                {"Content-Type": "application/json"}), timeout=300))
+        except Exception as e:
+            print(f"  zillow profile failed: {e}")
+            return {}
+        os.makedirs("zillow-cache", exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+    for it in items if isinstance(items, list) else []:
+        p = zillow_place(it, city)
+        if all(w in p["displayName"]["text"].lower() for w in words):
+            office = (it.get("businessAddress") or {}).get("address1")
+            return {**p["zillow"], **({"Zillow office address": office} if office else {})}
+    return {}
+
+
 def zillow_count(city, brokerage=""):
     """Free preview: how many Zillow agents match (Apify dbCountOnly -- nothing charged but the run start)."""
     town, _, state = [p.strip() for p in city.partition(",")]
@@ -1305,20 +1339,19 @@ def person(args):
     z = {}
     count = zillow_count(city, brokerage) if os.environ.get("APIFY_TOKEN") and brokerage else 0
     if count > 150:
-        log(f"{count} agents at '{brokerage}' in {city} -- too many to pull (~${count * 0.0029:.2f}); "
-            "use a more specific --brokerage")
+        log(f"{count} agents at '{brokerage}' in {city} -- too many to pull; looking up their own Zillow profile")
     elif count:
         words = name_words(name) or set(name.lower().split())
         for _, p in zillow_agents(city, 0, 0, count, brokerage=brokerage):  # billed per delivered record only
             if words and all(w in p["displayName"]["text"].lower() for w in words):
                 z = p["zillow"]
                 break
-        log(", ".join(f"{k}: {v}" for k, v in z.items() if v and not k.startswith("_")) or "not found on Zillow")
-        if z:
-            facts.append("Zillow: " + ", ".join(f"{k} {v}" for k, v in z.items()
-                                                 if v and not k.startswith("_") and k != "Zillow Profile"))
-    else:
-        log("skipped (needs APIFY_TOKEN and --brokerage, and the brokerage must be in Zillow's US data)")
+    if not z and os.environ.get("APIFY_TOKEN"):  # big brokerage / no brokerage / not in the city pull
+        z = zillow_by_profile(name, city)
+    log(", ".join(f"{k}: {v}" for k, v in z.items() if v and not k.startswith("_")) or "not found on Zillow")
+    if z:
+        facts.append("Zillow: " + ", ".join(f"{k} {v}" for k, v in z.items()
+                                             if v and not k.startswith("_") and k != "Zillow Profile"))
 
     print("3. Websites")
     host_of = lambda s: urlparse(s if "//" in s else "https://" + s).netloc.lower().removeprefix("www.")
