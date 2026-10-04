@@ -796,7 +796,9 @@ def brain_names(principles):
     return [p.split(" (from")[0].lstrip("- ") for p in principles if not p.startswith(("- PASSAGE", "- BRAIN"))]
 
 
-QUOTE_RULE = ("For EVERY principle you use, give: principle (exact name from the list), source (the book/video title "
+QUOTE_RULE = ("Ground the message in AT LEAST ONE principle and its source passage -- the best fit for this exact "
+              "moment (for a soft brush-off that may be a principle about objections or staying in the conversation, "
+              "not a close); never return an empty list. For EVERY principle you use, give: principle (exact name from the list), source (the book/video title "
               "and the page or time of the PASSAGE it comes from), quote (the exact words copied from that PASSAGE -- "
               "short, verbatim, never invented; \"\" if no passage fits), how (which line of my message applies it "
               "and how).")
