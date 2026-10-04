@@ -790,6 +790,13 @@ BANNED_WORDS = ("H1, heading tag, schema, microdata, JSON-LD, meta, Open Graph, 
 def read_screenshots(images, notes=""):
     """AI looks at screenshots of someone's LinkedIn / Instagram / Facebook page -> who they are + what to open with."""
     answer = gemini(
+        "FIRST decide what the screenshots show. If they show a CONVERSATION (DMs/chat on any app) instead of a "
+        "profile, return JSON {kind: \"conversation\", name: the OTHER person's name/handle (the one I'm talking "
+        "to -- e.g. the name in the chat header or 'Message @name' box), platform, context (2-3 sentences: who they "
+        "are and what the conversation is about), goal (what I seem to be trying to achieve with them), messages: "
+        "[{from: \"me\" or \"them\", text}] in order, every message visible}. If they show neither a profile nor "
+        "a conversation, return {error: what they show instead}. OTHERWISE (a profile) return kind \"profile\" "
+        "and the keys below.\n\n"
         "These are screenshots of one person's social media profile/page (LinkedIn, Instagram or Facebook). I sell "
         "real estate agents a service that fixes how their website and listings are read by Google and AI "
         "assistants (ChatGPT, Gemini). Read EVERYTHING visible and return JSON with keys: name (full name as shown), "
@@ -807,8 +814,8 @@ def read_screenshots(images, notes=""):
     try:
         profile = json.loads(answer)
         return profile if isinstance(profile, dict) else {}
-    except (ValueError, TypeError):
-        return {}
+    except (ValueError, TypeError):  # a plain-text answer is the AI explaining why it can't
+        return {"error": " ".join(answer.split())[:300]} if answer else {}
 
 
 def outreach(name, facts, channel, sender=""):
@@ -1140,6 +1147,35 @@ def realtor_by_profile(name):
     return out
 
 
+def google_rank(name, city, domains=()):
+    """The searches a buyer/seller types, on real Google (Apify, ~$0.0045 each): is this agent in the top 10?
+    Found = their name in a result or one of their own sites ranking. Returns (summary, [lines])."""
+    town = city.split(",")[0].strip()
+    queries = [f"best real estate agent {city}", f"best listing agent {city}", f"top realtor in {town}",
+               f"realtor for first time home buyers {city}", f"who can sell my house fast in {town}"]
+    words = name_words(name) or set(name.lower().split())
+    results = google_search(queries)
+    if not results:
+        return "", []
+    by_query = {}
+    for r in results:
+        by_query.setdefault(r["_query"].lower(), []).append(r)
+    lines, found = [], 0
+    for q in queries:
+        rows = by_query.get(q.lower(), [])
+        hit = None
+        for r in rows[:10]:
+            text = f"{r.get('title', '')} {r.get('description', '')}".lower()
+            host = urlparse(r.get("url", "")).netloc.lower().removeprefix("www.")
+            if all(w in text for w in words) or any(d and host.endswith(d) for d in domains):
+                hit = f"#{r.get('position') or rows.index(r) + 1} ({host})"
+                break
+        found += bool(hit)
+        top = ", ".join(urlparse(r.get("url", "")).netloc.removeprefix("www.") for r in rows[:3])
+        lines.append(f"{'✅ ' + hit if hit else '❌ not in top 10'} -- \"{q}\" (top: {top})")
+    return f"Google: shows up in {found}/{len(queries)} buyer searches", lines
+
+
 def zillow_count(city, brokerage=""):
     """Free preview: how many Zillow agents match (Apify dbCountOnly -- nothing charged but the run start)."""
     town, _, state = [p.strip() for p in city.partition(",")]
@@ -1282,7 +1318,8 @@ def google_search(queries):
         os.makedirs("search-cache", exist_ok=True)
         with open(cache, "w", encoding="utf-8") as f:
             json.dump(pages, f)
-    return [r for page in pages for r in page.get("organicResults", [])]
+    return [{**r, "_query": (page.get("searchQuery") or {}).get("term", "")}  # which search it answered
+            for page in pages for r in page.get("organicResults", [])]
 
 
 def web_identity(name, city):
@@ -1456,6 +1493,13 @@ def person(args):
         if grades.get(key):
             log(f"{key}: {grades[key][:300]}")
             facts.append(f"{key}: {grades[key]}")
+    if os.environ.get("APIFY_TOKEN"):
+        own = [host_of(s) for s in all_sites  # their own domain only -- compass.com/nyc isn't "their" site
+               if urlparse(s if "//" in s else "https://" + s).path in ("", "/")]
+        summary, lines = google_rank(name, city, own)
+        if summary:
+            log(summary + "\n" + "\n".join("   " + l for l in lines))
+            facts.append(summary + " (real Google results, top 10):\n" + "\n".join(lines))
     if notes:
         facts.append(f"From their LinkedIn: {notes}")
 

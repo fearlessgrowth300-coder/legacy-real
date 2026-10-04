@@ -526,7 +526,11 @@ def chat_from_screens(paths, platform, name, notes, email):
     report, so it shows up in Prospect Chat with coaching for every reply."""
     profile = m.read_screenshots(paths, notes)
     if not profile:
-        raise RuntimeError("The AI couldn't read the screenshots -- check Settings → AI engine, then try again")
+        raise RuntimeError("The AI didn't answer -- check Settings → AI engine (Test), then try again")
+    if profile.get("error"):
+        raise RuntimeError(f"The AI couldn't use these screenshots: {profile['error']}")
+    if profile.get("kind") == "conversation":
+        return chat_from_conversation(profile, platform, name, notes, email)
     name = name or str(profile.get("name") or "").strip() or "Unknown"
     city = str(profile.get("city") or "").strip()
     email = email or (str(profile.get("email") or "") if EMAIL.fullmatch(str(profile.get("email") or "")) else "")
@@ -569,6 +573,31 @@ def chat_from_screens(paths, platform, name, notes, email):
     return {"slug": slug}
 
 
+def chat_from_conversation(convo, platform, name, notes, email):
+    """Screenshots of an existing DM thread -> a chat with those messages, coached on their latest one."""
+    name = name or str(convo.get("name") or "").strip() or "Unknown"
+    slug = re.sub(r"\W+", "-", name).strip("-") or "Unknown"
+    goal = notes or str(convo.get("goal") or "")
+    report = (f"{name} | | {time.ctime()}\n\nFACTS (from a {convo.get('platform') or platform} conversation "
+              f"screenshot):\n- {convo.get('context', '')}\n- My goal: {goal}\n\nSALES BRAIN PRINCIPLES:\n")
+    os.makedirs(REPORTS, exist_ok=True)
+    with open(os.path.join(REPORTS, f"{slug}-{time.strftime('%Y-%m-%d-%H%M')}.txt"), "w", encoding="utf-8") as f:
+        f.write(report)
+    at = time.strftime("%Y-%m-%d %H:%M")
+    turns = [{"role": "me" if str(x.get("from")).lower() == "me" else "them", "text": str(x.get("text", ""))[:4000],
+              "at": at} for x in convo.get("messages") or [] if isinstance(x, dict) and x.get("text")]
+    last_them = max((i for i, t in enumerate(turns) if t["role"] == "them"), default=None)
+    if last_them is not None:  # coach the newest message from them, same as pasting it in
+        turns[last_them]["coach"] = coach(name, report, turns[:last_them], turns[last_them]["text"],
+                                          convo.get("platform") or platform, goal=goal)
+    with LOCK:
+        chat = load_chat(slug)
+        chat.update(platform=convo.get("platform") or platform, goal=goal, **({"email": email} if email else {}))
+        chat["turns"] = chat["turns"] + turns
+        save_chat(slug, chat)
+    return {"slug": slug}
+
+
 def lead_row(file, name):
     path = os.path.join(RESULTS, os.path.basename(file))
     rows = list(csv.DictReader(open(path, encoding="utf-8"))) if os.path.exists(path) else []
@@ -585,18 +614,20 @@ def lead_email(row):
     return m.outreach(row["Business Name"], facts, "email", os.environ.get("SMTP_FROM_NAME", ""))
 
 
-def coach(name, report, turns, their_message, platform="LinkedIn", images=(), note=""):
+def coach(name, report, turns, their_message, platform="LinkedIn", images=(), note="", goal=""):
     """What they said -> what it means -> next goal -> reply, grounded in the report + Sales Brain."""
     history = [("agent" if t["role"] == "me" else "prospect", t["text"] or "(sent a screenshot)") for t in turns]
     facts = report.split("SALES BRAIN PRINCIPLES:")[0][-6000:]
     principles = m.sales_brain(
-        f"I'm in a {platform} conversation with {name}, a real estate agent/broker I want as a client for my service "
-        "(fixing how their website and listings are read by Google and AI assistants). They just replied: "
+        f"I'm in a {platform} conversation with {name}. "
+        + (f"My goal: {goal}. " if goal else "They're a real estate agent/broker I want as a client for my service "
+           "(fixing how their website and listings are read by Google and AI assistants). ") + "They just replied: "
         f"\"{their_message or '(a screenshot)'}\". " + (f"My goal: {note}. " if note else "")
         + "What is really going on in their reply and what should I say next?", history)
     convo = "\n".join(f"{'ME' if r == 'agent' else name.upper()}: {t}" for r, t in history)
     answer = m.gemini(
-        f"You coach me in a {platform} sales conversation with {name}.\n\nWHAT I KNOW ABOUT THEM (checked facts):\n"
+        f"You coach me in a {platform} conversation with {name}." + (f" MY GOAL: {goal}." if goal else "")
+        + "\n\nWHAT I KNOW ABOUT THEM (checked facts):\n"
         f"{facts}\n\nCONVERSATION SO FAR:\n{convo}\n{name.upper()} (latest): {their_message or '(see screenshots)'}\n\n"
         + (f"I attached {len(images)} screenshot(s) (their reply, a post, their profile...): read them fully and use "
            "what they show.\n" if images else "")
@@ -967,7 +998,7 @@ class Handler(BaseHTTPRequestHandler):
             if match[2] == "theirs":
                 def work():
                     result = coach(name, open(report_path, encoding="utf-8").read(), history, text,
-                                   chat.get("platform", "LinkedIn"), paths, note)
+                                   chat.get("platform", "LinkedIn"), paths, note, chat.get("goal", ""))
                     with LOCK:
                         latest = load_chat(slug)
                         latest["turns"][index]["coach"] = result
