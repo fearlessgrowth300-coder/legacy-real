@@ -523,7 +523,8 @@ def socials_by_search(people):
         # the profile's OWN name must be theirs: LinkedIn "Name - Headline | LinkedIn", Instagram "Name (@handle) ..."
         own = re.split(r" - | \| |\(|•|·", title)[0]
         handle = url.rstrip("/").rsplit("/", 1)[-1]
-        if (i is not None and net not in found.get(i, {}) and re.match(pattern, url) and all(w in own for w in words)
+        if (i is not None and net not in found.get(i, {}) and re.match(pattern, url)
+                and all(re.search(rf"{re.escape(w)}", own) for w in words)
                 and re.search(r"[a-z]", handle, re.I)):
             found.setdefault(i, {})[net] = url.split("?")[0]
     return found
