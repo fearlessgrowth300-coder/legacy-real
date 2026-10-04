@@ -414,7 +414,8 @@ async function chat(slug) {
       if (c.reply) box.append(h('div', {class: 'k'}, 'Suggested reply'), h('div', {class: 'reply'}, c.reply));
       if (c.why) box.append(h('div', {class: 'k'}, 'Why (your Sales Brain)'), h('div', {class: 'small'}, c.why));
       if (c.watch_out) box.append(h('div', {class: 'k'}, "Don't say"), h('div', {class: 'small'}, c.watch_out));
-      if ((c.principles || []).length) box.append(h('div', {class: 'k'}, 'Principles pulled'), h('div', {class: 'tiny muted'}, c.principles.join(' · ')));
+      if ((c.used || []).length) box.append(h('div', {class: 'k'}, 'From your books & videos'), ...c.used.map(usedItem));
+      else if ((c.principles || []).length) box.append(h('div', {class: 'k'}, 'Principles pulled'), h('div', {class: 'tiny muted'}, c.principles.join(' · ')));
       box.append(h('div', {class: 'row', style: 'margin-top:10px'},
         h('button', {class: 'btn sm', onclick: () => { mine.value = c.reply; mine.focus(); }}, 'Use this reply'),
         h('button', {class: 'btn secondary sm', onclick: e => navigator.clipboard.writeText(c.reply).then(() => { e.target.textContent = 'Copied'; })}, icon('copy'), 'Copy')));
@@ -498,11 +499,15 @@ function newChat() {
   const close = () => { document.removeEventListener('paste', onPaste); close0(); };
   new MutationObserver((_, obs) => { if (!document.body.contains(form)) { document.removeEventListener('paste', onPaste); obs.disconnect(); } }).observe(document.body, {childList: true});
 }
+function usedItem(u) {  // a principle + the exact words from the book/video it came from
+  return h('div', {class: 'small', style: 'margin-top:8px'}, h('b', {}, u.principle || ''), u.how ? ' — ' + u.how : '',
+    u.quote ? h('blockquote', {class: 'source-quote'}, `“${u.quote}”`, h('div', {class: 'tiny muted'}, '— ' + (u.source || ''))) : null);
+}
 function principlesBox(d) {
   const box = h('div', {class: 'coach', style: 'margin-top:12px'});
   if (!d.brain) return box.append(h('div', {class: 'k'}, 'Sales Brain'), h('div', {class: 'small'}, 'Not reached — this draft was written WITHOUT your principles. Check Settings → Sales Brain.')), box;
   box.append(h('div', {class: 'k'}, 'Sales Brain principles used'));
-  for (const u of d.principles_used || []) box.append(h('div', {class: 'small', style: 'margin-top:6px'}, h('b', {}, u.principle || ''), u.how ? ' — ' + u.how : ''));
+  for (const u of d.principles_used || []) box.append(usedItem(u));
   if (!(d.principles_used || []).length) box.append(h('div', {class: 'tiny muted'}, 'Pulled: ' + (d.principles || []).join(' · ')));
   return box;
 }

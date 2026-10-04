@@ -778,9 +778,40 @@ def sales_brain(situation, conversation=()):
     except Exception as e:
         print(f"  sales brain error: {e}")
         return []
-    return [f"- {p.get('name')} (from \"{p.get('source', {}).get('title', '')}\"): {p.get('what_it_teaches', '')} "
-            f"HOW TO APPLY: {p.get('how_to_apply', '')} WHEN NOT TO USE: {p.get('when_not_to_use', '')}"
-            for p in data.get("principles", [])[:6]]
+    principles = [f"- {p.get('name')} (from \"{p.get('source', {}).get('title', '')}\"): {p.get('what_it_teaches', '')} "
+                  f"HOW TO APPLY: {p.get('how_to_apply', '')} WHEN TO USE: {p.get('when_to_use', '')} "
+                  f"WHEN NOT TO USE: {p.get('when_not_to_use', '')}" for p in data.get("principles", [])[:6]]
+    # the actual words from the books/videos (page or timestamp), so the writer quotes the source, not a summary
+    passages = [f"- PASSAGE [{e.get('source', {}).get('type', '')} \"{e.get('source', {}).get('title', '')}\", "
+                f"{e.get('locator', '')}]: \"{' '.join(str(e.get('excerpt', '')).split())}\""
+                for e in data.get("evidence", [])[:8] if e.get("excerpt")]
+    analysis = data.get("analysis") or {}
+    guidance = [f"- BRAIN GUIDANCE: next objective: {analysis.get('next_objective', '')}. "
+                f"{data.get('generation_instructions', '')}"] if data.get("generation_instructions") else []
+    return principles + passages + guidance
+
+
+def brain_names(principles):
+    """Principle names only (no passages / guidance lines)."""
+    return [p.split(" (from")[0].lstrip("- ") for p in principles if not p.startswith(("- PASSAGE", "- BRAIN"))]
+
+
+QUOTE_RULE = ("For EVERY principle you use, give: principle (exact name from the list), source (the book/video title "
+              "and the page or time of the PASSAGE it comes from), quote (the exact words copied from that PASSAGE -- "
+              "short, verbatim, never invented; \"\" if no passage fits), how (which line of my message applies it "
+              "and how).")
+
+
+def keep_real_quotes(used, principles):
+    """Anti-hallucination gate: a quote must really be in the passages the Sales Brain sent."""
+    squash = lambda t: re.sub(r"[^a-z0-9]+", " ", str(t).lower()).strip()
+    source = squash(" ".join(p for p in principles if p.startswith("- PASSAGE")))
+    out = []
+    for u in used if isinstance(used, list) else []:
+        if isinstance(u, dict):
+            q = squash(u.get("quote", ""))
+            out.append({**u, "quote": u.get("quote", "") if q and q in source else ""})
+    return out
 
 
 BANNED_WORDS = ("H1, heading tag, schema, microdata, JSON-LD, meta, Open Graph, og:type, coordinates, latitude, crawler, "
@@ -827,7 +858,7 @@ def outreach(name, facts, channel, sender=""):
         "correctly by Google and AI assistants. What should the first message open with, and how do I frame it so "
         "they reply and saying yes to a next step feels obvious, without sounding like spam? What I know:\n"
         + fact_text)
-    names = [p.split(" (from")[0].lstrip("- ") for p in principles]
+    names = brain_names(principles)
     answer = gemini(
         f"Write a first {channel} message from me to {name}, plus a follow-up for after they reply.\n"
         + ("It's an EMAIL: include a short, specific subject line (no clickbait, no 'quick question'). "
@@ -842,9 +873,8 @@ def outreach(name, facts, channel, sender=""):
         "ChatGPT/Google; never claim cause and effect; keep 'may'/'likely' where the facts are uncertain. "
         "No placeholders like [Name]."
         + (f" Sign the email off with just: {sender}." if sender and channel == "email" else "")
-        + ("\n\nYou MUST build the message on the sales principles below (from my own books and videos). Return "
-           "principles_used as a list of {principle: its exact name from the list, how: which line of the message "
-           "applies it and how}. " if principles else "")
+        + ("\n\nYou MUST build the message on the sales principles and source PASSAGES below (from my own books "
+           "and videos). Return principles_used as a list. " + QUOTE_RULE + " " if principles else "")
         + "Return JSON with keys: subject, message, followup, principles_used.\n\nFACTS:\n" + fact_text
         + ("\n\nMY SALES TRAINING PRINCIPLES:\n" + "\n".join(principles) if principles else ""), as_json=True)
     try:
@@ -853,7 +883,7 @@ def outreach(name, facts, channel, sender=""):
     except (ValueError, TypeError):
         out = {"message": answer}
     out["principles"], out["brain"] = names, bool(principles)
-    out["principles_used"] = [u for u in out.get("principles_used") or [] if isinstance(u, dict)]
+    out["principles_used"] = keep_real_quotes(out.get("principles_used"), principles)
     return out
 
 
@@ -1527,11 +1557,15 @@ def person(args):
         "facts say so. NEVER say people, visitors or clients can't open a site unless the facts say the site is DOWN "
         "or the domain does not exist. No URLs in backticks; no technical words like DNS, subdomain, bot-challenge. "
         "Anything marked '1 source, verify' must not be stated as fact to them (say 'some sites still show...'). "
-        "After the messages, list which principle you used for each line.\n\nFACTS:\n" + fact_text +
+        "After the messages, list for each line which principle you used AND quote the exact words of the source "
+        "PASSAGE it rests on, with the book/video title and page or time (copy them, never invent).\n\nFACTS:\n"
+        + fact_text +
         "\n\nMY SALES TRAINING PRINCIPLES:\n" + "\n".join(principles)) if ai_ready() else ""
     report = (f"{name} | {city} | {time.ctime()}\n\nFACTS (checked by the tool):\n{fact_text}\n\n"
               f"TEST IN CHATGPT:\n{grades.get('Test in ChatGPT', '')}\n\n"
-              f"SALES BRAIN PRINCIPLES:\n" + "\n".join(p[:220] for p in principles) + f"\n\nMESSAGES:\n{messages}\n")
+              f"SALES BRAIN PRINCIPLES:\n" + "\n".join(p[:220] for p in principles if not p.startswith("- "
+              "PASSAGE")) + "\n\nSOURCE PASSAGES (from your books/videos):\n"
+              + "\n".join(p for p in principles if p.startswith("- PASSAGE")) + f"\n\nMESSAGES:\n{messages}\n")
     os.makedirs("reports", exist_ok=True)
     path = os.path.join("reports", re.sub(r"\W+", "-", name).strip("-") + f"-{time.strftime('%Y-%m-%d-%H%M')}.txt")
     with open(path, "w", encoding="utf-8") as f:
@@ -1738,6 +1772,10 @@ if __name__ == "__main__":
     assert ai_review(page, {}, {}) == ('script tag pasted inside JS [evidence: function runPageScript(){ '
                                        '<script type="application/ld+json">]'), "hallucination gate broken"
     gemini = real_gemini
+    brain = ['- Value Over Price (from "OBJECTION CRUSHER"): x', '- PASSAGE [pdf "OBJECTION CRUSHER", Pages 1-2]: "Price is never an absolute number"']
+    assert brain_names(brain) == ["Value Over Price"]
+    assert [u["quote"] for u in keep_real_quotes([{"quote": "price is never an absolute number"}, {"quote": "a made-up line"}], brain)] == [
+        "price is never an absolute number", ""], "quote gate broken"
     real_run = subprocess.run  # Claude CLI output with ```json fences -> bare JSON
     subprocess.run = lambda *a, **k: type("R", (), {"stdout": json.dumps({"result": 'Sure:\n```json\n[{"a": 1}]\n```'}),
                                                      "stderr": ""})()

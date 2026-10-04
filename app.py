@@ -561,7 +561,9 @@ def chat_from_screens(paths, platform, name, notes, email):
         except (ValueError, RuntimeError):
             pass  # another job is running / odd field: fall back to the quick opener from the screenshots alone
     out = m.outreach(name, facts, f"{platform} DM")
-    used = "\n".join(f"- {u.get('principle', '')}: {u.get('how', '')}" for u in out["principles_used"])
+    used = "\n".join(f"- {u.get('principle', '')}: {u.get('how', '')}"
+                     + (f"\n    \"{u['quote']}\" -- {u.get('source', '')}" if u.get("quote") else "")
+                     for u in out["principles_used"])
     report = (f"{name} | {city} | {time.ctime()}\n\nFACTS (read from their {platform} screenshots):\n"
               + "\n".join(f"- {f}" for f in facts) + "\n\nSALES BRAIN PRINCIPLES:\n"
               + ("\n".join(f"- {n}" for n in out["principles"]) or "- (Sales Brain not reached -- check Settings)")
@@ -633,11 +635,12 @@ def coach(name, report, turns, their_message, platform="LinkedIn", images=(), no
            "what they show.\n" if images else "")
         + (f"MY NOTE TO YOU (what I want -- do exactly this; the reply field is the message to send): {note}\n\n"
            if note else "") +
-        "MY SALES TRAINING PRINCIPLES (from my own books/videos):\n" + "\n".join(principles) + "\n\n"
+        "MY SALES TRAINING (principles + exact PASSAGES from my own books/videos):\n" + "\n".join(principles) + "\n\n"
         "Return JSON with keys: said (their message in plain words, 1 sentence), meaning (what's really going on: "
         "tone, interest level, what they want, any objection or buying signal), next_goal (the one thing my next "
         f"message should achieve), reply (the exact message to send, natural {platform} style, max 90 words, no "
-        "jargon), why (which principle(s) you applied and how, 1-2 lines), watch_out (one thing NOT to say now). "
+        "jargon), why (which principle(s) you applied and how, 1-2 lines), watch_out (one thing NOT to say now), "
+        "used (a list: " + m.QUOTE_RULE + "). "
         "Rules: answer any direct question honestly first; if they clearly say no, respect it and leave the door "
         "open; use ONLY the checked facts, never invent numbers/results/urgency, never promise rankings in "
         "Google or ChatGPT; don't state industry trends or how Google/AI choose who to recommend as facts (say "
@@ -648,7 +651,8 @@ def coach(name, report, turns, their_message, platform="LinkedIn", images=(), no
     except (ValueError, TypeError):
         out = {"said": "", "meaning": "", "next_goal": "", "reply": answer or "(AI unavailable, try again)",
                "why": "", "watch_out": ""}
-    out["principles"] = [p.split(":")[0].lstrip("- ") for p in principles]
+    out["principles"] = m.brain_names(principles)
+    out["used"] = m.keep_real_quotes(out.get("used"), principles)
     return out
 
 
