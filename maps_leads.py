@@ -524,7 +524,7 @@ def socials_by_search(people):
         own = re.split(r" - | \| |\(|•|·", title)[0]
         handle = url.rstrip("/").rsplit("/", 1)[-1]
         if (i is not None and net not in found.get(i, {}) and re.match(pattern, url)
-                and all(re.search(rf"{re.escape(w)}", own) for w in words)
+                and all(re.search(rf"\b{re.escape(w)}\b", own) for w in words)
                 and re.search(r"[a-z]", handle, re.I)):
             found.setdefault(i, {})[net] = url.split("?")[0]
     return found
