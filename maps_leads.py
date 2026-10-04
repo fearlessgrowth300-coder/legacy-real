@@ -1088,6 +1088,58 @@ def zillow_by_profile(name, city):
     return {}
 
 
+def realtor_by_profile(name):
+    """The agent's Realtor.com profile (found via Google) through Apify's brilliant_gum/realtor-scraper,
+    agent-detail mode: ~$0.0045 search + $0.015 per run, cached a week. Works on the free Apify plan (tested)."""
+    words = name_words(name) or set(name.lower().split())
+    url = next((r["url"] for r in google_search([f'site:realtor.com/realestateagents "{name}"'])
+                if re.match(r"https://www\.realtor\.com/realestateagents/", r.get("url", ""))
+                and all(w in r.get("title", "").lower() for w in words)), None)
+    if not url:
+        return {}
+    import hashlib
+    cache = os.path.join("zillow-cache", "realtor-" + hashlib.sha1(url.encode()).hexdigest() + ".json")
+    if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 7 * 86400:
+        items = json.load(open(cache, encoding="utf-8"))
+    else:
+        try:
+            items = json.load(urllib.request.urlopen(urllib.request.Request(
+                "https://api.apify.com/v2/acts/brilliant_gum~realtor-scraper/run-sync-get-dataset-items?"
+                + urlencode({"token": os.environ["APIFY_TOKEN"], "timeout": 270}),
+                json.dumps({"mode": ["agent-detail"], "agentUrls": [url], "includeAgentReviews": False}).encode(),
+                {"Content-Type": "application/json"}), timeout=300))
+        except Exception as e:
+            print(f"  realtor.com profile failed: {e}")
+            return {}
+        os.makedirs("zillow-cache", exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+    it = next((i for i in items if isinstance(i, dict) and all(w in str(i.get("fullName", "")).lower() for w in words)),
+              None) if isinstance(items, list) else None
+    if not it:
+        return {}
+    money = lambda v: f"${v / 1e6:.1f}M" if v >= 1e6 else f"${v / 1e3:.0f}K"
+    listings = it.get("forSaleCount") or 0
+    socials = [k.removeprefix("social") for k in ("socialFacebook", "socialInstagram", "socialLinkedin",
+                                                    "socialTwitter", "socialYoutube") if it.get(k)]
+    out = {
+        "Realtor.com profile": url,
+        "Realtor.com listings for sale": (f"{listings} ({money(it['forSaleMin'])}-{money(it['forSaleMax'])})"
+                                          if listings and it.get("forSaleMin") and it.get("forSaleMax") else listings),
+        "Realtor.com reviews": f"{it.get('reviewsCount') or 0}" + (f" ({it['averageRating']} stars)"
+                                                                   if it.get("averageRating") else ""),
+        "Realtor.com sales (12 mo)": it.get("dealsLast12mo") or "",
+        "Realtor.com phone": it.get("phone") or "",
+        "Realtor.com office": ", ".join(x for x in (it.get("officeName"), it.get("officeAddress")) if x),
+        "Realtor.com website": it.get("website") or "none listed",
+        "Realtor.com socials": ", ".join(socials) or "none listed",
+    }
+    if it.get("isEmptyProfile") or not (it.get("bio") or it.get("photoUrl")):
+        out["Realtor.com profile EMPTY"] = (f"no bio, no photo, {it.get('reviewsCount') or 0} reviews"
+                                            + (f" -- while {listings} of their homes are for sale there" if listings else ""))
+    return out
+
+
 def zillow_count(city, brokerage=""):
     """Free preview: how many Zillow agents match (Apify dbCountOnly -- nothing charged but the run start)."""
     town, _, state = [p.strip() for p in city.partition(",")]
@@ -1335,7 +1387,7 @@ def person(args):
         sites += [s for s in web["sites"] if s not in sites]
         brokerage = brokerage or (solid or list(web["brokerages"]) or [""])[0].split(",")[0]
 
-    print("2. Zillow (Apify)")
+    print("2. Zillow + Realtor.com (Apify)")
     z = {}
     count = zillow_count(city, brokerage) if os.environ.get("APIFY_TOKEN") and brokerage else 0
     if count > 150:
@@ -1352,6 +1404,15 @@ def person(args):
     if z:
         facts.append("Zillow: " + ", ".join(f"{k} {v}" for k, v in z.items()
                                              if v and not k.startswith("_") and k != "Zillow Profile"))
+    r = realtor_by_profile(name) if os.environ.get("APIFY_TOKEN") else {}
+    log("Realtor.com: " + (", ".join(f"{k.replace('Realtor.com ', '')}: {v}" for k, v in r.items() if v)
+                           or "not found"))
+    if r:
+        facts.append("Realtor.com: " + ", ".join(f"{k.replace('Realtor.com ', '')} {v}" for k, v in r.items()
+                                                 if v and k != "Realtor.com profile"))
+        if z.get("Zillow Reviews") and "Realtor.com profile EMPTY" in r:
+            facts.append(f"Strong on Zillow ({z['Zillow Reviews']} reviews) but their Realtor.com profile is empty "
+                         "-- buyers who find them there see no bio, photo or reviews")
 
     print("3. Websites")
     host_of = lambda s: urlparse(s if "//" in s else "https://" + s).netloc.lower().removeprefix("www.")
