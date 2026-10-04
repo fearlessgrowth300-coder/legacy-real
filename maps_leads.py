@@ -477,6 +477,54 @@ def audit_site(place, html=None):
     return grades
 
 
+def render_contacts(sites):
+    """Second pass in a real browser for sites whose plain download showed no social links -- most agent sites
+    (IDX / website builders) add their footer links with JavaScript. Returns {site: (emails, socials)}."""
+    out = {}
+    if not sites:
+        return out
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=os.environ.get("HEADLESS") == "1")
+        page = browser.new_page()
+        for site in sites:
+            try:
+                page.goto(site if "//" in site else "https://" + site, timeout=25000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3500)  # footer widgets load last
+                html = page.content()
+                out[site] = (extract_emails(html), extract_socials(html))
+            except Exception:
+                continue
+        browser.close()
+    return out
+
+
+COMPANY_WORDS = {"realty", "group", "team", "teams", "homes", "properties", "property", "real", "estate", "remax",
+                 "re/max", "inc", "llc", "brokerage", "associates", "partners", "agency", "preferred", "realtors"}
+
+
+def socials_by_search(people):
+    """[(row, name, town)] -> {row: {"linkedin": url, "instagram": url}} from Google (site: searches, ~$0.0045 each).
+    Only for person names, and the result's title must carry every distinctive word of the name."""
+    people = [(i, n, t) for i, n, t in people
+              if 2 <= len(n.split()) <= 3 and not COMPANY_WORDS & set(n.lower().split())]
+    if not people:
+        return {}
+    queries = {}
+    for i, name, town in people:
+        queries[f'site:linkedin.com/in "{name}" {town}'.lower()] = (i, name, "linkedin")
+        queries[f'site:instagram.com "{name}" realtor'.lower()] = (i, name, "instagram")
+    found = {}
+    for r in google_search(list(queries)):
+        i, name, net = queries.get(r.get("_query", "").lower(), (None, "", ""))
+        url, title = r.get("url", ""), r.get("title", "").lower()
+        words = name_words(name) or set(name.lower().split())
+        pattern = r"https://(\w+\.)?linkedin\.com/in/[^/?#]+" if net == "linkedin" else r"https://www\.instagram\.com/[A-Za-z0-9_.]+/?$"
+        if i is not None and net not in found.get(i, {}) and re.match(pattern, url) and all(w in title for w in words):
+            found.setdefault(i, {})[net] = url.split("?")[0]
+    return found
+
+
 def find_contacts(site):
     # ponytail: homepage + a few common contact paths, no JS rendering; add Playwright if too many sites come back empty
     if not site:
@@ -1699,6 +1747,24 @@ def build_sheet(places):
     with ThreadPoolExecutor(4) as pool:  # more parallel = small hosts drop connections
         emails, socials = map(list, zip(*pool.map(find_contacts, [p.get("websiteUri", "") for _, p in places]))) if places else ([], [])
         audits = list(pool.map(audit_site, [p for _, p in places]))
+    socials = [dict(x) for x in socials]
+    bare = [i for i, (_, p) in enumerate(places) if p.get("websiteUri") and not socials[i]]
+    if bare:
+        print(f"{len(bare)} sites showed no social links -- opening them in a real browser...")
+        rendered = render_contacts([places[i][1]["websiteUri"] for i in bare])
+        for i in bare:
+            # socials only: a rendered brokerage page lists every colleague's email
+            socials[i] = {**rendered.get(places[i][1]["websiteUri"], (set(), {}))[1], **socials[i]}
+    searched = {}
+    if os.environ.get("APIFY_TOKEN"):
+        need = [(i, p.get("displayName", {}).get("text", ""), city_of(p.get("formattedAddress", "")).split(",")[0])
+                for i, (_, p) in enumerate(places)
+                if not ({**p.get("socials", {}), **socials[i]}.keys() >= {"linkedin", "instagram"})]
+        if need:
+            print(f"looking up LinkedIn / Instagram by name on Google for {len(need)} agents...")
+            searched = socials_by_search(need)
+            for i, nets in searched.items():
+                socials[i] = {**nets, **socials[i]}  # the website's own links win
     if ai_ready():
         print("asking AI: AI review of page sources, AI visibility per city, drafting pitches...")
     for (_, p), g in zip(places, audits):  # sequential: free-tier rate limits
@@ -1726,22 +1792,25 @@ def build_sheet(places):
         p["zillow"] = {**p.get("google", {}), **p.get("zillow", {})}
         g["Prospect Score"] = prospect_score(p, g)
     rank = {"EXCELLENT": 0, "OKAY": 1, "UNKNOWN": 2, "POOR": 3}
-    rows = sorted(zip(places, emails, sources, socials, audits),  # best prospects first, then biggest producers
+    notes = [("found by Google name search, check it's them: " + ", ".join(sorted(searched[i])))
+             if i in searched and any(socials[i].get(n) == u for n, u in searched[i].items()) else ""
+             for i in range(len(places))]
+    rows = sorted(zip(places, emails, sources, socials, audits, notes),  # best prospects first, then biggest producers
                   key=lambda r: (rank.get(r[4]["Prospect Score"].split(":")[0], 2), -r[0][1]["zillow"].get("_volume", 0)))
     out = os.environ.get("LEADS_OUT", "leads.csv")  # the web app gives every job its own file
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["ZIP", "Prospect Score", "Business Name", "Website URL", "Main Office Phone", "Emails",
                     "Email Source", *(zillow_cols if has_zillow else []),
-                    *(n.title() for n in SOCIAL_NETS), "Fails", *GRADE_COLS, "AI Review", "AI Visibility", "Test in ChatGPT", "Pitch",
+                    *(n.title() for n in SOCIAL_NETS), "Social Note", "Fails", *GRADE_COLS, "AI Review", "AI Visibility", "Test in ChatGPT", "Pitch",
                     "Address"])
-        for (z, p), e, src, soc, g in rows:
+        for (z, p), e, src, soc, g, note in rows:
             soc = {**p.get("socials", {}), **soc}  # website's links win, Zillow's fill the gaps
             fails = sum(g.get(c, "").startswith("FAIL") for c in GRADE_COLS)
             w.writerow([z, g["Prospect Score"], p.get("displayName", {}).get("text", ""), p.get("websiteUri", ""),
                         p.get("nationalPhoneNumber", ""), "; ".join(e), src,
                         *([p.get("zillow", {}).get(c, "") for c in zillow_cols] if has_zillow else []),
-                        *(soc.get(n, "") for n in SOCIAL_NETS), fails, *(g.get(c, "") for c in GRADE_COLS),
+                        *(soc.get(n, "") for n in SOCIAL_NETS), note, fails, *(g.get(c, "") for c in GRADE_COLS),
                         g.get("AI Review", ""), g.get("AI Visibility", ""), g.get("Test in ChatGPT", ""), g.get("Pitch", ""),
                         p.get("formattedAddress", "")])
     print(f"Saved {len(places)} rows ({sum(bool(e) for e in emails)} with email) -> {out}")
