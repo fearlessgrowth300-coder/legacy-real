@@ -499,7 +499,7 @@ def render_contacts(sites):
     return out
 
 
-COMPANY_WORDS = {"realty", "group", "team", "teams", "homes", "properties", "property", "real", "estate", "remax",
+COMPANY_WORDS = {"cities", "city", "station", "realty", "group", "team", "teams", "homes", "properties", "property", "real", "estate", "remax",
                  "re/max", "inc", "llc", "brokerage", "associates", "partners", "agency", "preferred", "realtors"}
 
 
@@ -520,7 +520,11 @@ def socials_by_search(people):
         url, title = r.get("url", ""), r.get("title", "").lower()
         words = name_words(name) or set(name.lower().split())
         pattern = r"https://(\w+\.)?linkedin\.com/in/[^/?#]+" if net == "linkedin" else r"https://www\.instagram\.com/[A-Za-z0-9_.]+/?$"
-        if i is not None and net not in found.get(i, {}) and re.match(pattern, url) and all(w in title for w in words):
+        # the profile's OWN name must be theirs: LinkedIn "Name - Headline | LinkedIn", Instagram "Name (@handle) ..."
+        own = re.split(r" - | \| |\(|•|·", title)[0]
+        handle = url.rstrip("/").rsplit("/", 1)[-1]
+        if (i is not None and net not in found.get(i, {}) and re.match(pattern, url) and all(w in own for w in words)
+                and re.search(r"[a-z]", handle, re.I)):
             found.setdefault(i, {})[net] = url.split("?")[0]
     return found
 
@@ -1851,6 +1855,11 @@ if __name__ == "__main__":
     assert ai_review(page, {}, {}) == ('script tag pasted inside JS [evidence: function runPageScript(){ '
                                        '<script type="application/ld+json">]'), "hallucination gate broken"
     gemini = real_gemini
+    _gs = google_search
+    google_search = lambda q: [{"_query": q[0], "url": "https://www.linkedin.com/in/howard-walker-1", "title": "Howard Walker - Tom Duffy Team | LinkedIn"},
+                               {"_query": q[0], "url": "https://www.linkedin.com/in/tomduffy", "title": "Tom Duffy - Realtor | LinkedIn"}]
+    assert socials_by_search([(0, "Tom Duffy", "Sewell")]) == {0: {"linkedin": "https://www.linkedin.com/in/tomduffy"}}
+    google_search = _gs
     brain = ['- Value Over Price (from "OBJECTION CRUSHER"): x', '- PASSAGE [pdf "OBJECTION CRUSHER", Pages 1-2]: "Price is never an absolute number, it is relative"']
     assert brain_names(brain) == ["Value Over Price"]
     assert [u["quote"] for u in keep_real_quotes([{"quote": "price is never an absolute number"}, {"quote": "a made-up line"},
