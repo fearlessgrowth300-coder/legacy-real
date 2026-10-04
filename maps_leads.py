@@ -783,12 +783,17 @@ def sales_brain(situation, conversation=()):
                   f"WHEN NOT TO USE: {p.get('when_not_to_use', '')}" for p in data.get("principles", [])[:6]]
     # the actual words from the books/videos (page or timestamp), so the writer quotes the source, not a summary
     passages = [f"- PASSAGE [{e.get('source', {}).get('type', '')} \"{e.get('source', {}).get('title', '')}\", "
-                f"{e.get('locator', '')}]: \"{' '.join(str(e.get('excerpt', '')).split())}\""
+                f"{e.get('locator', '')}]: \"{clean_excerpt(e.get('excerpt', ''))}\""
                 for e in data.get("evidence", [])[:8] if e.get("excerpt")]
     analysis = data.get("analysis") or {}
     guidance = [f"- BRAIN GUIDANCE: next objective: {analysis.get('next_objective', '')}. "
                 f"{data.get('generation_instructions', '')}"] if data.get("generation_instructions") else []
     return principles + passages + guidance
+
+
+def clean_excerpt(text):
+    """Video transcripts carry [01:23:18] every few words -- drop them so a sentence can be quoted verbatim."""
+    return " ".join(re.sub(r"\[\d{1,2}:\d{2}(?::\d{2})?\]", " ", str(text)).split())
 
 
 def brain_names(principles):
@@ -798,7 +803,9 @@ def brain_names(principles):
 
 QUOTE_RULE = ("Ground the message in AT LEAST ONE principle and its source passage -- the best fit for this exact "
               "moment (for a soft brush-off that may be a principle about objections or staying in the conversation, "
-              "not a close); never return an empty list. For EVERY principle you use, give: principle (exact name from the list), source (the book/video title "
+              "not a close); never return an empty list. Prefer principles that a PASSAGE backs up, and AT LEAST ONE "
+              "item MUST carry a verbatim quote: copy a whole phrase or sentence exactly as written in a PASSAGE. "
+              "For EVERY principle you use, give: principle (exact name from the list), source (the book/video title "
               "and the page or time of the PASSAGE it comes from), quote (the exact words copied from that PASSAGE -- "
               "short, verbatim, never invented; \"\" if no passage fits), how (which line of my message applies it "
               "and how).")
@@ -811,8 +818,9 @@ def keep_real_quotes(used, principles):
     out = []
     for u in used if isinstance(used, list) else []:
         if isinstance(u, dict):
-            q = squash(u.get("quote", ""))
-            out.append({**u, "quote": u.get("quote", "") if q and q in source else ""})
+            parts = [squash(x) for x in re.split(r"\.\.\.|…", str(u.get("quote", ""))) if squash(x)]
+            real = parts and all(x in source for x in parts) and sum(len(x.split()) for x in parts) >= 4
+            out.append({**u, "quote": u.get("quote", "") if real else ""})
     return out
 
 
@@ -1774,10 +1782,11 @@ if __name__ == "__main__":
     assert ai_review(page, {}, {}) == ('script tag pasted inside JS [evidence: function runPageScript(){ '
                                        '<script type="application/ld+json">]'), "hallucination gate broken"
     gemini = real_gemini
-    brain = ['- Value Over Price (from "OBJECTION CRUSHER"): x', '- PASSAGE [pdf "OBJECTION CRUSHER", Pages 1-2]: "Price is never an absolute number"']
+    brain = ['- Value Over Price (from "OBJECTION CRUSHER"): x', '- PASSAGE [pdf "OBJECTION CRUSHER", Pages 1-2]: "Price is never an absolute number, it is relative"']
     assert brain_names(brain) == ["Value Over Price"]
-    assert [u["quote"] for u in keep_real_quotes([{"quote": "price is never an absolute number"}, {"quote": "a made-up line"}], brain)] == [
-        "price is never an absolute number", ""], "quote gate broken"
+    assert [u["quote"] for u in keep_real_quotes([{"quote": "price is never an absolute number"}, {"quote": "a made-up line"},
+                                                  {"quote": "Price is never… it is relative"}], brain)] == [
+        "price is never an absolute number", "", "Price is never… it is relative"], "quote gate broken"
     real_run = subprocess.run  # Claude CLI output with ```json fences -> bare JSON
     subprocess.run = lambda *a, **k: type("R", (), {"stdout": json.dumps({"result": 'Sure:\n```json\n[{"a": 1}]\n```'}),
                                                      "stderr": ""})()
