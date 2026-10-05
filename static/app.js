@@ -212,7 +212,8 @@ function contactTable(rows) {  // spreadsheet view: who, how to reach them, wher
       cell(...(emails.length ? emails.slice(0, 2).flatMap((e, i) => [i ? h('br') : null, h('a', {href: 'mailto:' + e, onclick: ev => ev.stopPropagation()}, e)]) : ['—']),
         more > 0 ? h('div', {class: 'tiny muted'}, `+${more} more (tap row)`) : null),
       cell(site ? a(site, site.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').slice(0, 40)) : '—'),
-      cell(...(socials.length ? socials.flatMap(([k, label], i) => [i ? ' · ' : '', a(r[k], label)]) : ['—'])),
+      cell(...(socials.length ? socials.flatMap(([k, label], i) => [i ? ' · ' : '', a(r[k], label)]) : ['—']),
+        r['Active On'] ? h('div', {class: 'tiny muted', style: 'margin-top:4px'}, r['Active On']) : null),
       cell(r['Sales (12 mo)'] || '—'));
   });
   return h('div', {class: 'table-wrap'}, h('table', {class: 'sheet-table'},
@@ -308,10 +309,15 @@ async function leads(_, params) {
   const pick = h('select', {'aria-label': 'Result set'}, sets.map(s => h('option', {value: s.file}, `${s.label} · ${s.date} · ${s.rows} leads`)));
   pick.value = params.get('file') || sets[0].file;
   const dl = h('a', {class: 'btn secondary'}, icon('download'), 'CSV');
+  const activeBtn = h('button', {class: 'btn secondary', title: 'Latest Instagram / Facebook / LinkedIn post per lead (~$0.01 each)', onclick: async () => {
+    if (!confirm(`Check where these ${rows.length} leads are active? About $${(rows.length * 0.01).toFixed(2)} of Apify credit.`)) return;
+    try { const job = await api('/api/jobs/activity', {file: pick.value}); toast('Checking — takes a few minutes'); state.running = job.id; updateJobChip(); go('#/activity/' + job.id); }
+    catch (e) { toast(e.message, true); }
+  }}, icon('zap'), 'Where are they active?');
   const q = h('input', {type: 'search', placeholder: 'Search name, brokerage, email…', value: params.get('q') || ''});
   let filter = 'ALL', view = localStorage.getItem('leadsView') || 'cards'; const chips = h('div', {class: 'chips'}); const grid = h('div', {class: 'leads'}); let rows = [];
   const views = h('div', {class: 'seg', role: 'group'});
-  p.append(h('div', {class: 'card', style: 'margin-bottom:16px'}, h('div', {class: 'row wrap'}, h('div', {style: 'flex:1;min-width:220px'}, pick), views, dl),
+  p.append(h('div', {class: 'card', style: 'margin-bottom:16px'}, h('div', {class: 'row wrap'}, h('div', {style: 'flex:1;min-width:220px'}, pick), views, activeBtn, dl),
     h('div', {class: 'row wrap', style: 'margin-top:12px'}, h('div', {class: 'search', style: 'flex:1;min-width:220px'}, icon('search'), q), chips)), grid);
   const draw = () => {
     const counts = {ALL: rows.length}; rows.forEach(r => counts[tier(r['Prospect Score'])] = (counts[tier(r['Prospect Score'])] || 0) + 1);
@@ -342,6 +348,7 @@ function leadCard(r, open) {
   return h('div', {class: 'card lead', tabindex: 0, role: 'button', onclick: open, onkeydown: e => { if (e.key === 'Enter') open(); }},
     h('div', {class: 'row between'}, h('div', {class: 'name'}, r['Business Name'] || '(no name)'), h('span', {class: 'pill ' + t}, t)),
     why ? h('div', {class: 'why'}, why) : null,
+    r['Active On'] ? h('div', {class: 'active-on'}, '📍 Active on: ' + r['Active On']) : null,
     h('div', {class: 'facts'}, fact('building', r['Brokerage']), fact('trend', r['Sales (12 mo)'] ? r['Sales (12 mo)'] + ' sales/yr' : ''),
       fact('star', r['Zillow Reviews'] ? r['Zillow Reviews'] + ' reviews' : (r['Google Rating'] ? r['Google Rating'] + '★ Google' : '')),
       fact('mail', r['Emails'] ? r['Emails'].split(';')[0] : ''), fact('alert', r['Fails'] && r['Fails'] !== '0' ? r['Fails'] + ' fails' : '')));
@@ -361,7 +368,7 @@ function leadSheet(r) {
       ['Website', r['Website URL'] ? link(r['Website URL']) : ''],
       ['Social', socials.length ? h('span', {}, ...socials.flatMap((s, i) => [i ? ' · ' : '', link(r[s], s)]),
         r['Social Note'] ? h('div', {class: 'tiny muted'}, r['Social Note']) : null) : ''],
-      ['Address', r['Address']]])),
+      ['Address', r['Address']], ['Active on', r['Active On']]])),
     h('div', {class: 'section'}, h('h3', {}, 'Business'), kv([['Brokerage', r['Brokerage']], ['Sales (12 mo)', r['Sales (12 mo)']], ['Total sales', r['Total Sales']],
       ['Avg price', r['Avg Price']], ['Est. volume', r['Est. Volume (12 mo)']], ['Active listings', r['Active Listings']], ['Reviews', r['Zillow Reviews'] || r['Google Reviews']],
       ['Expansion', r['Expansion']], ['Team', r['Team'] ? `${r['Team']} (${r['Team Size']})` : ''], ['Pays Zillow ads', r['Zillow Premier (pays Zillow)']],
@@ -534,7 +541,7 @@ function emailSheet({to = '', subject = '', body = '', slug = '', lead = '', ema
 }
 
 function jobItem(j) {
-  const label = {hunt: 'Hunt', zips: 'ZIP search', person: 'Research', audit: 'Audit', zillow: 'Zillow'}[j.type] || j.type;
+  const label = {hunt: 'Hunt', zips: 'ZIP search', person: 'Research', audit: 'Audit', zillow: 'Zillow', activity: 'Active check'}[j.type] || j.type;
   const detail = Object.entries(j.params || {}).map(([k, v]) => `${k} ${v}`).join(' · ');
   return h('div', {class: 'item', onclick: () => go('#/activity/' + j.id)},
     h('div', {class: 'icon-box'}, icon({hunt: 'flame', zips: 'pin', person: 'research', audit: 'audit', zillow: 'building'}[j.type] || 'activity')),

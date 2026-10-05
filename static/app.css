@@ -208,3 +208,5 @@ html, body { overflow-x: hidden; max-width: 100%; }
 .bubble, .coach, .title, .sub, .quote, .log, .why { overflow-wrap: anywhere; }
 
 .source-quote { margin: 6px 0 0; padding: 8px 12px; border-left: 3px solid var(--accent); background: var(--surface-2); border-radius: 6px; font-style: italic; overflow-wrap: anywhere; }
+
+.active-on { font-size: 13px; color: var(--good); margin: 6px 0 2px; overflow-wrap: anywhere; }

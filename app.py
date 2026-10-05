@@ -387,6 +387,11 @@ def build_args(kind, p):
     if kind == "audit":
         url = clean(p.get("url"), re.compile(r"^https?://[^\s]{3,300}$"), required=True)
         return ["--audit", url, clean(p.get("address")), clean(p.get("phone")), clean(p.get("name"))]
+    if kind == "activity":  # fill 'Active On' for an existing results sheet
+        file = os.path.join(RESULTS, os.path.basename(str(p.get("file", ""))))
+        if not (file.endswith(".csv") and os.path.exists(file)):
+            raise ValueError("pick a results sheet first")
+        return ["--activity", file]
     if kind == "zillow":
         return ["--zillow-db", clean(p.get("city"), required=True), "--min-reviews", num("min_reviews", 10, 0, 10000),
                 "--min-sales", num("min_sales", 0, 0, 1000), "--max", num("max", 25, 1, 200)]
@@ -970,7 +975,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"ok": True})
         if match := re.fullmatch(r"/api/jobs/([\w-]+)/stop", path):
             return self._send({"ok": True}) if stop_job(match[1]) else self._send({"error": "that job isn't running"}, 400)
-        if match := re.fullmatch(r"/api/jobs/(hunt|zips|person|audit|zillow)", path):
+        if match := re.fullmatch(r"/api/jobs/(hunt|zips|person|audit|zillow|activity)", path):
             try:
                 return self._send(start_job(match[1], self._body()))
             except (ValueError, RuntimeError) as e:

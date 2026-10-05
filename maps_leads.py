@@ -530,6 +530,133 @@ def socials_by_search(people):
     return found
 
 
+def apify_run(actor, body, wait=900):
+    """Start an Apify actor, wait for it (run-sync caps at 5 min -- big batches take longer), return its items."""
+    token = os.environ["APIFY_TOKEN"]
+    api = "https://api.apify.com/v2"
+    run = json.load(urllib.request.urlopen(urllib.request.Request(
+        f"{api}/acts/{actor}/runs?token={token}", json.dumps(body).encode(), {"Content-Type": "application/json"}),
+        timeout=60))["data"]
+    deadline = time.time() + wait
+    while run["status"] in ("READY", "RUNNING") and time.time() < deadline:
+        time.sleep(10)
+        run = json.load(urllib.request.urlopen(f"{api}/actor-runs/{run['id']}?token={token}", timeout=60))["data"]
+    if run["status"] != "SUCCEEDED":
+        print(f"  {actor}: run {run['status'].lower()}")
+    return json.load(urllib.request.urlopen(
+        f"{api}/datasets/{run['defaultDatasetId']}/items?clean=true&token={token}", timeout=120))
+
+
+def social_key(url):
+    """'https://www.instagram.com/SoldByBucci/' -> 'soldbybucci' (the account part, to match results to inputs)."""
+    parts = [x for x in urlparse(url if "//" in url else "https://" + url).path.lower().split("/") if x]
+    if parts[:1] in (["in"], ["company"], ["pg"], ["people"]) and len(parts) > 1:
+        parts = parts[1:]
+    return parts[0] if parts else ""
+
+
+def ago(stamp):
+    """ISO date (UTC) / unix seconds or ms -> (days, '2 days ago')."""
+    import calendar
+    try:
+        t = float(stamp) / (1000 if float(stamp) > 1e12 else 1) if str(stamp).replace(".", "").isdigit() else \
+            calendar.timegm(time.strptime(str(stamp)[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return None, ""
+    days = max(0, int((time.time() - t) // 86400))
+    return days, ("today" if days == 0 else "yesterday" if days == 1 else f"{days} days ago" if days < 60
+                  else f"{days // 30} months ago" if days < 730 else f"{days // 365} years ago")
+
+
+def activity_check(profiles):
+    """{"instagram": [url...], "facebook": [...], "linkedin": [...]} -> {url: (days or None, "posted 2 days ago")}.
+    One batched Apify run per network, latest posts only (~$0.0026 IG / ~$0.006 FB / ~$0.002 LinkedIn per profile),
+    cached 3 days. Days None = profile found but no public posts / not reachable."""
+    import hashlib
+    out = {}
+    jobs = {
+        "instagram": ("apify~instagram-profile-scraper", lambda urls: {"usernames": [social_key(u) for u in urls]}),
+        "facebook": ("apify~facebook-posts-scraper", lambda urls: {"startUrls": [{"url": u} for u in urls],
+                                                                   "resultsLimit": 3}),
+        "linkedin": ("harvestapi~linkedin-profile-posts", lambda urls: {"targetUrls": urls, "maxPosts": 2,
+                                                                        "scrapeReactions": False,
+                                                                        "scrapeComments": False}),
+    }
+    for net, urls in profiles.items():
+        urls = sorted({u for u in urls if u and social_key(u)})
+        if not urls or net not in jobs:
+            continue
+        actor, body = jobs[net]
+        cache = os.path.join("zillow-cache", f"active-{net}-" + hashlib.sha1("|".join(urls).encode()).hexdigest() + ".json")
+        if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 3 * 86400:
+            items = json.load(open(cache, encoding="utf-8"))
+        else:
+            print(f"  checking {len(urls)} {net} profiles for recent posts...")
+            try:
+                items = apify_run(actor, body(urls))
+            except Exception as e:
+                print(f"  {net} activity check failed: {e}")
+                continue
+            os.makedirs("zillow-cache", exist_ok=True)
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump(items, f)
+        latest = {}  # account key -> newest post stamp
+        for it in items if isinstance(items, list) else []:
+            if net == "instagram":
+                key = str(it.get("username", "")).lower()
+                stamps = [p.get("timestamp") for p in it.get("latestPosts") or [] if p.get("timestamp")]
+            elif net == "facebook":
+                key = social_key(it.get("facebookUrl") or it.get("inputUrl") or it.get("pageUrl") or "")
+                stamps = [it.get("time") or it.get("timestamp")]
+            else:
+                author = it.get("author") or {}
+                query = it.get("query") if isinstance(it.get("query"), dict) else {}
+                key = str(author.get("publicIdentifier")
+                          or social_key(author.get("linkedinUrl") or query.get("targetUrl") or "")).lower()
+                posted = it.get("postedAt") or {}
+                stamps = [posted.get("timestamp") or posted.get("date") if isinstance(posted, dict) else posted]
+            for st in filter(None, stamps):
+                days, _ = ago(st)
+                if days is not None and (key not in latest or days < ago(latest[key])[0]):
+                    latest[key] = st
+            latest.setdefault(key, None)
+        for u in urls:
+            st = latest.get(social_key(u))
+            out[u] = ago(st) if st else (None, "no public posts found" if social_key(u) in latest else "couldn't check")
+    return out
+
+
+def active_on(socials, checked):
+    """'Instagram (posted 2 days ago) · LinkedIn (3 months ago)' -- most recent first, then the silent ones."""
+    rows = []
+    for net in ("instagram", "facebook", "linkedin"):
+        if socials.get(net) and socials[net] in checked:
+            days, text = checked[socials[net]]
+            rows.append((days if days is not None else 10 ** 6, f"{net.title().replace('Linkedin', 'LinkedIn')} "
+                                                                f"({'posted ' + text if days is not None else text})"))
+    return " · ".join(t for _, t in sorted(rows))
+
+
+def add_activity(csv_path):
+    """Fill / refresh the 'Active On' column of a results sheet (the Leads page button)."""
+    rows = list(csv.DictReader(open(csv_path, encoding="utf-8")))
+    if not rows:
+        return
+    cols = list(rows[0])
+    if "Active On" not in cols:
+        cols.insert(cols.index("Business Name") + 1, "Active On")
+    socials = [{n: r.get(n.title(), "") for n in ("instagram", "facebook", "linkedin")} for r in rows]
+    checked = activity_check({n: [x[n] for x in socials] for n in ("instagram", "facebook", "linkedin")})
+    for r, soc in zip(rows, socials):
+        r["Active On"] = active_on(soc, checked) or "no social profiles found"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows({c: r.get(c, "") for c in cols} for r in rows)
+    print(f"Active On filled for {sum(1 for r in rows if r['Active On'] != 'no social profiles found')} of "
+          f"{len(rows)} leads -> {csv_path}")
+
+
 def find_contacts(site):
     # ponytail: homepage + a few common contact paths, no JS rendering; add Playwright if too many sites come back empty
     if not site:
@@ -1069,6 +1196,9 @@ def main():
         return
     if sys.argv[1:2] == ["--hunt"]:
         hunt(sys.argv[2:])
+        return
+    if sys.argv[1:2] == ["--activity"]:  # where is each lead active? (fills 'Active On' in a results sheet)
+        add_activity(sys.argv[2] if len(sys.argv) > 2 else os.environ.get("LEADS_OUT", "leads.csv"))
         return
     if sys.argv[1:2] == ["--zillow-db"]:  # busy Zillow agents via Apify, then the full audit
         args = sys.argv[2:]
@@ -1819,6 +1949,9 @@ def build_sheet(places):
                         g.get("AI Review", ""), g.get("AI Visibility", ""), g.get("Test in ChatGPT", ""), g.get("Pitch", ""),
                         p.get("formattedAddress", "")])
     print(f"Saved {len(places)} rows ({sum(bool(e) for e in emails)} with email) -> {out}")
+    if os.environ.get("APIFY_TOKEN"):
+        print("checking where each agent is active (Instagram / Facebook / LinkedIn)...")
+        add_activity(out)
 
 
 if __name__ == "__main__":
@@ -1856,6 +1989,11 @@ if __name__ == "__main__":
     assert ai_review(page, {}, {}) == ('script tag pasted inside JS [evidence: function runPageScript(){ '
                                        '<script type="application/ld+json">]'), "hallucination gate broken"
     gemini = real_gemini
+    assert social_key("https://www.instagram.com/SoldByBucci/") == "soldbybucci"
+    assert social_key("https://www.linkedin.com/in/darrengiordano") == "darrengiordano"
+    assert ago(time.time() - 2 * 86400)[1] == "2 days ago" and ago("2020-01-01T00:00:00.000Z")[1].endswith("years ago")
+    assert active_on({"instagram": "i", "linkedin": "l"}, {"i": (2, "2 days ago"), "l": (None, "no public posts found")}) \
+        == "Instagram (posted 2 days ago) · LinkedIn (no public posts found)"
     _gs = google_search
     google_search = lambda q: [{"_query": q[0], "url": "https://www.linkedin.com/in/howard-walker-1", "title": "Howard Walker - Tom Duffy Team | LinkedIn"},
                                {"_query": q[0], "url": "https://www.linkedin.com/in/tomduffy", "title": "Tom Duffy - Realtor | LinkedIn"}]
