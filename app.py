@@ -492,8 +492,15 @@ def people():
 
 
 def first_message(report):
-    block = re.search(r"MESSAGE 1\**\s*(.*?)(?:\n\s*\*?Line|\n\s*\*{3}|\n\s*-{3}|\*\*MESSAGE 2|MESSAGE 2)", report, re.S)
-    return block[1].strip() if block else ""
+    """The first message from the report, whatever heading style the AI used: 'MESSAGE 1', '**Message 1** (55 words)',
+    '## Message 1 (80 words)'... up to Message 2 / a rule / the next heading."""
+    text = report.split("MESSAGES:", 1)[-1]
+    block = re.search(r"message\W{0,3}1\b[^\n]*\n(.*?)(?=\n[#*\s]*message\W{0,3}2\b|\n\s*-{3,}|\n#{1,6}\s|\n\s*\*?line\b|\Z)",
+                      text, re.S | re.I)
+    if not block:
+        return ""
+    lines = [re.sub(r"^\s*>\s?", "", line) for line in block[1].strip().splitlines()]  # unquote '> ' blocks
+    return "\n".join(lines).strip().strip("*").strip()
 
 
 def load_chat(slug):
